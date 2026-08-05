@@ -1,0 +1,43 @@
+# /etc/systemd/system/meta-mcp.service
+#
+# systemctl daemon-reload && systemctl enable --now meta-mcp
+# journalctl -u meta-mcp -f    # uma linha por request: status, quem, duração
+
+[Unit]
+Description=MCP Meta Business Insights
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mcp
+Group=mcp
+WorkingDirectory=/opt/meta-business-insights-mcp
+ExecStart=/usr/bin/node dist/http.js
+Restart=always
+RestartSec=5
+
+# O token do Meta e os bearers da equipe ficam aqui, fora do repositório e
+# fora do systemd unit (que é world-readable). Modo 0600, dono root.
+EnvironmentFile=/etc/meta-mcp.env
+
+# Snapshots de seguidores: /var/lib/meta-mcp, criado pelo systemd com o dono
+# certo. META_DATA_DIR precisa apontar para cá no EnvironmentFile.
+StateDirectory=meta-mcp
+
+# O processo só precisa ler o próprio código e escrever os snapshots.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+
+[Install]
+WantedBy=multi-user.target
