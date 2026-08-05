@@ -48,7 +48,16 @@ npm run probe
 O probe imprime o portfólio descoberto, avisa quais páginas estão sem Page Access
 Token e puxa 4 meses de seguidores como amostra.
 
-## Configuração no Claude Desktop
+## Dois modos de execução
+
+| Modo | Entrypoint | Quando usar |
+| --- | --- | --- |
+| stdio | `dist/index.js` | Só você. O Claude Desktop sobe o processo local; o token do Meta fica na sua máquina |
+| HTTP | `dist/http.js` | A equipe inteira. O servidor roda numa VPS e o token do Meta nunca sai de lá |
+
+O servidor MCP é o mesmo nos dois — muda só quem o serve.
+
+## Configuração no Claude Desktop (modo stdio)
 
 `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
@@ -57,7 +66,7 @@ Token e puxa 4 meses de seguidores como amostra.
   "mcpServers": {
     "meta-business-insights": {
       "command": "node",
-      "args": ["/Users/kenji/Repositories/meta-business-insights-mcp/dist/index.js"],
+      "args": ["/caminho/para/meta-business-insights-mcp/dist/index.js"],
       "env": {
         "META_ACCESS_TOKEN": "SEU_TOKEN",
         "META_BUSINESS_ID": "SEU_BUSINESS_ID"
@@ -68,6 +77,133 @@ Token e puxa 4 meses de seguidores como amostra.
 ```
 
 Reinicie o Claude Desktop depois de salvar.
+
+## Servidor compartilhado numa VPS (modo HTTP)
+
+O ganho não é performance: é que o token do Meta fica só na VPS. Distribuir o
+`.env` para cada pessoa colocaria um token com acesso de escrita ao portfólio
+inteiro em N notebooks, sem forma de revogar um sem revogar todos.
+
+### 1. Tokens da equipe
+
+Um bearer por pessoa, não um compartilhado. Custa o mesmo e permite tirar
+alguém removendo uma linha:
+
+```bash
+openssl rand -hex 32   # repita por pessoa
+```
+
+```
+MCP_HTTP_TOKENS=ana:3f9c…,bruno:a71d…,carla:88e2…
+```
+
+O nome antes do `:` só serve para o log — cada linha do journal diz quem
+consultou. O servidor se recusa a subir com `MCP_HTTP_TOKENS` vazio, para que
+ninguém exponha o portfólio por esquecimento.
+
+### 2. Na VPS
+
+Conta de sistema sem login e sem home — o `useradd` do `shadow-utils` funciona
+tanto em Debian/Ubuntu quanto em RHEL/Alma/Rocky, ao contrário do `adduser`,
+que tem sintaxes diferentes em cada família:
+
+```bash
+useradd --system --user-group --shell /usr/sbin/nologin --no-create-home mcp
+git clone <repo> /opt/meta-business-insights-mcp
+cd /opt/meta-business-insights-mcp
+npm ci && npm run build
+chown -R mcp:mcp /opt/meta-business-insights-mcp
+```
+
+O `.env` **não** vai para a VPS. As variáveis ficam em `/etc/meta-mcp.env`
+(dono `root`, modo `0600`), que o systemd lê:
+
+```bash
+install -m 600 /dev/null /etc/meta-mcp.env
+$EDITOR /etc/meta-mcp.env     # META_ACCESS_TOKEN, META_BUSINESS_ID,
+                              # MCP_HTTP_TOKENS, META_DATA_DIR=/var/lib/meta-mcp
+cp deploy/meta-mcp.service /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now meta-mcp
+journalctl -u meta-mcp -f
+```
+
+### 3. TLS
+
+Aponte um subdomínio para o IP da VPS, ajuste o host no
+[deploy/Caddyfile](deploy/Caddyfile) e copie para `/etc/caddy/Caddyfile`. O
+Caddy emite o certificado sozinho.
+
+O `flush_interval -1` no proxy não é detalhe: sem ele o Caddy segura os eventos
+SSE até o fim do stream, e consultas longas — o Meta demora vários segundos —
+parecem travadas no Claude.
+
+O processo escuta em `127.0.0.1`. Não abra a porta 8787 no firewall: sem TLS o
+bearer viajaria em texto claro.
+
+Teste antes de plugar no Claude:
+
+```bash
+curl https://mcp.exemplo.com/healthz
+curl -X POST https://mcp.exemplo.com/mcp \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+### 4. Conectar o Claude Desktop de cada pessoa
+
+Duas formas, porque a interface de conectores do Claude só tem campos de OAuth
+— não há campo para um bearer fixo.
+
+**a) Conector personalizado com `static_headers`.** É o caminho limpo: o Owner
+da organização adiciona o conector uma vez em Configurações da organização, com
+o header, e cada pessoa só habilita. Só que `static_headers` está em **beta** e
+o credencial é único para a organização inteira — o que anula os tokens por
+pessoa. Confira se sua conta tem a opção antes de contar com ela.
+
+**b) Ponte local stdio→HTTP.** Funciona hoje, em qualquer plano, e preserva um
+token por pessoa. Cada uma põe no próprio `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "meta-business-insights": {
+      "command": "npx",
+      "args": [
+        "mcp-remote",
+        "https://mcp.exemplo.com/mcp",
+        "--header",
+        "Authorization:${AUTH_HEADER}"
+      ],
+      "env": {
+        "AUTH_HEADER": "Bearer SEU_TOKEN_PESSOAL"
+      }
+    }
+  }
+}
+```
+
+O `Authorization:${AUTH_HEADER}` sem espaço depois do `:` é intencional: o
+Claude Desktop no Windows não escapa espaços dentro de `args` ao chamar o
+`npx`, e o header chega quebrado. O espaço vai dentro da variável.
+
+O que essa forma **não** dá: acesso pelo claude.ai ou pelo app de celular — a
+ponte roda na máquina de cada pessoa. Se isso for necessário, o caminho é (a)
+ou implementar OAuth.
+
+### O que um bearer fixo não resolve
+
+Vale ter explícito, porque é fácil descobrir tarde:
+
+- **Sem consentimento por pessoa.** Quem tem o token tem tudo que as 9 tools
+  fazem, incluindo `graph_api_get`.
+- **Revogação é manual.** Sai alguém → editar `/etc/meta-mcp.env` e
+  `systemctl restart meta-mcp`.
+- **O token não expira sozinho.** Vale trocar periodicamente.
+- **Nunca coloque o token na URL** (`?token=…`). A especificação do MCP proíbe,
+  e URLs vazam em log de proxy, histórico e referrer. É por isso que aqui ele
+  vai no header.
 
 ## Tools
 
@@ -113,8 +249,9 @@ novos seguidores). Duas verificações independentes concordam:
 
 1. A soma de `FOLLOWER` bate exatamente com a soma de `follower_count` — que é bruto,
    nunca negativo em nenhum dos 30 dias medidos — nas três contas testadas.
-2. A soma de `FOLLOWER` de jan a jul/2026 em `@programa_dotz` deu 5.369, exatamente o
-   número que o Business Suite reporta como seguidores ganhos no período.
+2. Numa conta do portfólio, a soma de `FOLLOWER` de jan a jul/2026 deu 5.369 —
+   exatamente o número que o Business Suite reporta como seguidores ganhos no
+   período.
 
 Cuidado ao mexer em `classifyFollowType`: casar por substring quebra, porque
 `NON_FOLLOWER` também contém `FOLLOWER`.
