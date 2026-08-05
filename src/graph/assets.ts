@@ -253,15 +253,16 @@ export class PortfolioService {
     const { pages } = await this.get();
     if (!selector || selector.length === 0) return pages;
 
-    const wanted = new Set(selector.map((s) => s.trim().toLowerCase()));
+    // O "@" é opcional: o usuário escreve @perfil, mas a API guarda sem arroba.
+    const normalize = (s: string) => s.trim().toLowerCase().replace(/^@/, "");
+    const wanted = new Set(selector.map(normalize));
     const matched = pages.filter(
       (p) =>
-        wanted.has(p.id.toLowerCase()) ||
-        wanted.has(p.name.toLowerCase()) ||
+        wanted.has(normalize(p.id)) ||
+        wanted.has(normalize(p.name)) ||
         (p.instagram &&
-          (wanted.has(p.instagram.id.toLowerCase()) ||
-            (p.instagram.username &&
-              wanted.has(p.instagram.username.toLowerCase())))),
+          (wanted.has(normalize(p.instagram.id)) ||
+            (p.instagram.username && wanted.has(normalize(p.instagram.username))))),
     );
 
     if (matched.length === 0) {
