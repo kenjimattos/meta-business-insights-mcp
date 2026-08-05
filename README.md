@@ -109,10 +109,20 @@ não quem executou a ação:
 | `NON_FOLLOWER` | a conta deixou de seguir → **perda** |
 
 Isso contraria o que várias fontes de terceiros afirmam (que `NON_FOLLOWER` seriam os
-novos seguidores). A verificação: a soma de `FOLLOWER` bate **exatamente** com a soma
-de `follower_count` — que é bruto, nunca negativo em nenhum dos 30 dias medidos — nas
-três contas testadas. Cuidado ao mexer em `classifyFollowType`: casar por substring
-quebra, porque `NON_FOLLOWER` também contém `FOLLOWER`.
+novos seguidores). Duas verificações independentes concordam:
+
+1. A soma de `FOLLOWER` bate exatamente com a soma de `follower_count` — que é bruto,
+   nunca negativo em nenhum dos 30 dias medidos — nas três contas testadas.
+2. A soma de `FOLLOWER` de jan a jul/2026 em `@programa_dotz` deu 5.369, exatamente o
+   número que o Business Suite reporta como seguidores ganhos no período.
+
+Cuidado ao mexer em `classifyFollowType`: casar por substring quebra, porque
+`NON_FOLLOWER` também contém `FOLLOWER`.
+
+**O Business Suite reporta ganhos brutos.** No mesmo período acima, 4.208 contas
+deixaram de seguir, então o crescimento líquido foi de +1.161 — não 5.369. Ao comparar
+os relatórios deste servidor com a interface do Meta, compare a coluna "Ganhos", não o
+"Saldo".
 
 Consequência prática: se a conta ficou fora do ar para a API em algum período, a
 reconstrução para no primeiro buraco e devolve `—` dali para trás, em vez de inventar
