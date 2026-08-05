@@ -112,8 +112,17 @@ useradd --system --user-group --shell /usr/sbin/nologin --no-create-home mcp
 git clone <repo> /opt/meta-business-insights-mcp
 cd /opt/meta-business-insights-mcp
 npm ci && npm run build
-chown -R mcp:mcp /opt/meta-business-insights-mcp
 ```
+
+Os arquivos ficam de `root`, e está certo assim: o serviço só precisa **ler** o
+código, e as permissões padrão (`644`/`755`) já permitem isso. A única coisa que
+ele escreve são os snapshots, em `/var/lib/meta-mcp`, que o systemd cria com o
+dono correto pelo `StateDirectory`.
+
+Resista à tentação de rodar um `chown -R` aqui. Além de desnecessário, um erro
+de digitação no caminho — uma barra sobrando, um `opt` faltando — vira
+`chown -R mcp:mcp /`, que reescreve o dono do sistema inteiro e apaga os bits
+setuid de `sudo`, `su` e `passwd`. Não há como desfazer com outro `chown`.
 
 O `.env` **não** vai para a VPS. As variáveis ficam em `/etc/meta-mcp.env`
 (dono `root`, modo `0600`), que o systemd lê:
