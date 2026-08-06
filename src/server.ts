@@ -25,6 +25,9 @@ import { fetchFollowerSeries } from "./followers.js";
 import { aggregate, withDeltas, type GroupDimension } from "./aggregate.js";
 import { SnapshotStore } from "./store.js";
 import { captureSnapshot } from "./snapshot.js";
+import { fetchContent } from "./content.js";
+import { fetchComments } from "./comments.js";
+import { MS_METRICS } from "./metrics.js";
 import { resolveRange, today, type Granularity } from "./dates.js";
 import {
   IG_METRICS,
@@ -84,6 +87,38 @@ function fail(err: unknown) {
         ? err.message
         : String(err);
   return { content: [{ type: "text" as const, text: `Erro: ${message}` }], isError: true };
+}
+
+/**
+ * Colunas comparáveis entre Facebook e Instagram. A ordem aqui é a ordem da
+ * tabela; `saved` fica vazio no Facebook, que não tem o conceito.
+ */
+const NORMALIZED_COLUMNS: Record<string, string> = {
+  views: "Views",
+  likes: "Curtidas",
+  comments: "Comentários",
+  shares: "Compart.",
+  saved: "Salvos",
+  interactions: "Interações",
+};
+
+/** Trecho da legenda que cabe numa célula sem quebrar a tabela. */
+function snippet(text: string, max = 60): string {
+  return text.length > max ? `${text.slice(0, max)}…` : text || "—";
+}
+
+function metricLabel(metric: string): string {
+  return MS_METRICS.has(metric) ? `${metric} (s)` : metric;
+}
+
+/**
+ * A Graph API devolve tempo de visualização em milissegundos, enquanto o
+ * Business Suite mostra segundos. Converter aqui evita relatório errado por um
+ * fator de mil.
+ */
+function formatMetric(metric: string, value: number | undefined): number | null {
+  if (value === undefined) return null;
+  return MS_METRICS.has(metric) ? Math.round(value / 100) / 10 : value;
 }
 
 function assetLine(page: PageAsset): string {
@@ -480,6 +515,160 @@ export function createServer(): McpServer {
             issues: result.issues,
             deprecationNotes: notes,
           },
+        );
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  /* ------------------------------- conteúdo ------------------------------ */
+
+  server.registerTool(
+    "content_insights",
+    {
+      title: "Desempenho por publicação",
+      description:
+        "Desempenho de cada publicação no período — o equivalente à aba Conteúdo do " +
+        "Business Suite. Responde 'quais posts tiveram mais curtidas/salvamentos/comentários', " +
+        "'reels versus carrossel', 'os 10 melhores do trimestre'. Uma linha por publicação, " +
+        "ordenada pela métrica escolhida. Atenção: no Facebook 'likes' é o total de reações " +
+        "(curtida + amei + haha…), e 'saved' só existe no Instagram.",
+      inputSchema: z.object({
+        assets: assetsSchema,
+        since: sinceSchema,
+        until: untilSchema,
+        surfaces: z
+          .array(z.enum(["facebook", "instagram"]))
+          .default(["facebook", "instagram"])
+          .describe("Redes a incluir."),
+        sortBy: z
+          .string()
+          .default("interactions")
+          .describe(
+            "Ordena por: interactions, views, likes, comments, shares, saved — ou o nome cru " +
+              "de uma métrica da API (reach, ig_reels_avg_watch_time, post_clicks…).",
+          ),
+        limit: z.number().int().min(1).max(200).default(20),
+      }),
+    },
+    async ({ assets, since, until, surfaces, sortBy, limit }) => {
+      try {
+        const pages = await portfolio.resolveTargets(assets);
+        const range = resolveRange(since, until, 90);
+        const { rows, issues } = await fetchContent(client, pages, range, surfaces);
+
+        const valueOf = (row: (typeof rows)[number]) =>
+          row.normalized[sortBy] ?? row.raw[sortBy] ?? -1;
+        const top = [...rows].sort((a, b) => valueOf(b) - valueOf(a)).slice(0, limit);
+
+        const extra = sortBy in NORMALIZED_COLUMNS ? [] : [sortBy];
+        const headers = [
+          "Data",
+          "Rede",
+          "Ativo",
+          "Tipo",
+          "Publicação",
+          ...Object.values(NORMALIZED_COLUMNS),
+          ...extra.map(metricLabel),
+        ];
+
+        const table = top.map((row) => [
+          row.date,
+          row.surface === "facebook" ? "FB" : "IG",
+          row.assetName,
+          row.type,
+          snippet(row.caption),
+          ...Object.keys(NORMALIZED_COLUMNS).map((k) => row.normalized[k] ?? null),
+          ...extra.map((k) => formatMetric(k, row.raw[k])),
+        ]);
+
+        const head =
+          `**Publicações** · ${range.since} → ${range.until} · ordenado por ${sortBy} · ` +
+          `${rows.length} no período (exibindo ${top.length})`;
+
+        return text(
+          `${head}\n\n${markdownTable(headers, table)}` +
+            issuesBlock(
+              issues.map((i) => ({
+                assetName: i.asset,
+                surface: "conteúdo",
+                message: i.detail,
+              })),
+            ),
+          { since: range.since, until: range.until, sortBy, count: rows.length, posts: top },
+        );
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "content_comments",
+    {
+      title: "Comentários das publicações",
+      description:
+        "Lê os comentários das publicações do período, das duas redes. Serve para diagnóstico " +
+        "de reclamações, dúvidas recorrentes e sentimento. O Facebook geralmente não informa " +
+        "o autor (só perfis que consentiram); o Instagram informa o @usuario. " +
+        "Use `contains` para filtrar por palavra.",
+      inputSchema: z.object({
+        assets: assetsSchema,
+        since: sinceSchema,
+        until: untilSchema,
+        surfaces: z
+          .array(z.enum(["facebook", "instagram"]))
+          .default(["facebook", "instagram"]),
+        contains: z
+          .string()
+          .optional()
+          .describe("Filtra comentários que contenham este texto (sem diferenciar maiúsculas)."),
+        limit: z.number().int().min(1).max(500).default(100),
+      }),
+    },
+    async ({ assets, since, until, surfaces, contains, limit }) => {
+      try {
+        const pages = await portfolio.resolveTargets(assets);
+        const range = resolveRange(since, until, 30);
+        const { rows, issues } = await fetchComments(client, pages, range, surfaces);
+
+        const needle = contains?.toLowerCase();
+        const filtered = needle
+          ? rows.filter((r) => r.text.toLowerCase().includes(needle))
+          : rows;
+        const shown = filtered.slice(0, limit);
+
+        const table = shown.map((r) => [
+          r.date,
+          r.surface === "facebook" ? "FB" : "IG",
+          r.assetName,
+          r.author ?? "—",
+          r.text,
+          r.postCaption,
+        ]);
+
+        const head =
+          `**Comentários** · ${range.since} → ${range.until} · ` +
+          `${filtered.length} encontrados` +
+          (needle ? ` contendo "${contains}"` : "") +
+          (shown.length < filtered.length ? ` (exibindo ${shown.length})` : "");
+
+        return text(
+          `${head}\n\n` +
+            markdownTable(
+              ["Data", "Rede", "Ativo", "Autor", "Comentário", "Publicação"],
+              table,
+              { emptyMessage: "_Nenhum comentário no período._" },
+            ) +
+            issuesBlock(
+              issues.map((i) => ({
+                assetName: i.asset,
+                surface: "comentários",
+                message: i.detail,
+              })),
+            ),
+          { since: range.since, until: range.until, count: filtered.length, comments: shown },
         );
       } catch (err) {
         return fail(err);
