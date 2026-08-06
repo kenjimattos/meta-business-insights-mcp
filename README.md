@@ -283,6 +283,8 @@ Vale ter explícito, porque é fácil descobrir tarde:
 | `list_metrics` | Catálogo de métricas válidas + mapa das descontinuadas |
 | `save_followers_snapshot` | Grava o total de seguidores no histórico local |
 | `snapshot_history` | Lê o histórico local acumulado |
+| `reply_comment` | Responde um comentário em nome da conta (exige escrita liberada) |
+| `hide_comment` | Oculta ou reexibe um comentário (exige escrita liberada) |
 | `graph_api_get` | GET cru na Graph API, com o Page token já resolvido |
 
 Todas as tools de dados aceitam `assets` (IDs, nomes de Página ou `@usuario`),
@@ -379,6 +381,40 @@ não** — só perfis que consentiram ou Páginas aparecem identificados, o rest
 volta sem autor. O filtro `contains` serve para rastrear um problema específico
 ("não consigo", "estorno", "cobrança") através de todas as publicações do
 período.
+
+## Responder e ocultar comentários
+
+Desligado por padrão. Ligar exige **duas** condições simultâneas:
+
+```bash
+META_ALLOW_WRITES=true                      # na instância
+MCP_HTTP_TOKENS=ana:3f9c…:write,bruno:a71d… # e no bearer de quem publica
+```
+
+Sem as duas, `reply_comment` e `hide_comment` nem aparecem no `tools/list` —
+quem só consulta dados não enxerga as tools de publicação, em vez de vê-las e
+tomar um erro. No modo stdio não há bearer, então `META_ALLOW_WRITES` decide
+sozinho.
+
+Permissões adicionais: `pages_manage_engagement` no Facebook. O Instagram usa a
+mesma `instagram_manage_comments` da leitura. A task `Atividade da comunidade`
+já cobre moderação.
+
+**`reply_comment` não publica sem `confirm: true`.** Sem ele, devolve a prévia
+do que seria publicado e não chama a API. A resposta é pública e imediata, e
+excluir depois não desfaz quem já leu — a revisão antes é barata, o erro não.
+
+Toda escrita bem-sucedida vira uma linha `ESCRITA` no journal, ao lado da linha
+de request que identifica quem chamou.
+
+Escritas **não têm retry** em erro de rede ou 5xx, ao contrário das leituras: um
+POST que falha de forma ambígua pode ter sido processado, e repetir publicaria o
+comentário duas vezes. Só há retry em rate limit, onde o Meta rejeitou
+explicitamente.
+
+O tom de voz não mora aqui. A tool publica o texto que recebe; quem redige é o
+Claude, com os documentos de tom de voz como conhecimento de projeto ou Skill.
+Assim cada ajuste de tom não vira deploy do servidor.
 
 ## Métricas descontinuadas
 
