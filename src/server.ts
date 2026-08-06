@@ -27,10 +27,10 @@ import { SnapshotStore } from "./store.js";
 import { captureSnapshot } from "./snapshot.js";
 import { fetchContent } from "./content.js";
 import { fetchComments } from "./comments.js";
-import { MS_METRICS } from "./metrics.js";
 import { resolveRange, today, type Granularity } from "./dates.js";
 import {
   IG_METRICS,
+  MS_METRICS,
   PAGE_DEPRECATIONS,
   PAGE_METRICS,
   checkDeprecated,
@@ -131,7 +131,7 @@ function assetLine(page: PageAsset): string {
 export function createServer(): McpServer {
   const server = new McpServer({
     name: "meta-business-insights",
-    version: "0.1.0",
+    version: "0.1.1",
   });
 
   /* ------------------------------ portfólio ------------------------------ */
