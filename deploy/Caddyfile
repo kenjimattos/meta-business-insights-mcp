@@ -16,10 +16,14 @@ mcp.exemplo.com {
 
 	log {
 		output file /var/log/caddy/mcp.log
-		# O Caddy não registra o header Authorization por padrão, mas a
-		# diretiva abaixo garante isso mesmo se alguém trocar o formato.
-		format json {
-			request>headers>Authorization delete
+		# Remove o header Authorization do log. Precisa ser o encoder
+		# `filter` envolvendo o `json` — passar os campos direto para o
+		# `json` não é sintaxe válida e o Caddy recusa a configuração.
+		format filter {
+			wrap json
+			fields {
+				request>headers>Authorization delete
+			}
 		}
 	}
 }
