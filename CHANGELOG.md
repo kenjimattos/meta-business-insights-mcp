@@ -3,6 +3,55 @@
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 Versionamento [SemVer](https://semver.org/lang/pt-BR/).
 
+## [0.1.2] — 2026-08-06
+
+Primeira versão com escrita. Até aqui o servidor só lia; agora ele pode
+publicar em nome das contas, o que muda o perfil de risco e por isso vem
+desligado por padrão.
+
+### Adicionado
+
+- **`reply_comment`** — responde um comentário em nome da conta, nas duas redes.
+- **`hide_comment`** — oculta ou reexibe um comentário. Ocultar não notifica o
+  autor e mantém o comentário visível para ele; é o caminho usual para spam e
+  golpe, menos abrasivo que excluir.
+- **`GraphClient.post`** — primeiro método de escrita do cliente.
+- **`META_ALLOW_WRITES`** — libera as tools de escrita na instância. Desligado
+  por padrão.
+- **Sufixo `:write` nos bearers** (`MCP_HTTP_TOKENS=nome:token:write`), separando
+  quem consulta dados de quem publica em nome das marcas. O sufixo é
+  configuração do servidor: o cliente continua enviando só o token.
+
+### Segurança
+
+Escrita pública em nome de cliente é irreversível na prática — excluir depois
+não desfaz quem já leu. Quatro decisões refletem isso:
+
+- **Duas trancas em série** no modo HTTP: a instância precisa permitir escrita
+  *e* o bearer precisa do sufixo `:write`. Sem as duas, as tools não aparecem no
+  `tools/list` — quem não tem o direito não as enxerga, em vez de vê-las e tomar
+  erro ao usar.
+- **`reply_comment` exige `confirm: true`.** Sem ele devolve a prévia do que
+  seria publicado e não chama a API.
+- **Escritas não têm retry** em erro de rede nem em 5xx, ao contrário das
+  leituras: um POST que falha de forma ambígua pode ter sido processado, e
+  repetir publicaria o comentário duas vezes. Só há retry em rate limit, onde o
+  Meta rejeitou explicitamente e nada aconteceu.
+- **Auditoria:** toda escrita bem-sucedida vira uma linha `ESCRITA` no journal,
+  ao lado da linha de request que identifica quem chamou.
+
+### Permissões
+
+- `pages_manage_engagement` passa a ser necessária para responder e ocultar
+  comentários no Facebook. O Instagram usa a mesma `instagram_manage_comments`
+  já exigida pela leitura, e a task `Atividade da comunidade` já cobre moderação.
+
+### Notas
+
+- O tom de voz deliberadamente **não** mora no servidor. As tools publicam o
+  texto que recebem; a redação fica no Claude, com os documentos da equipe como
+  conhecimento de projeto ou Skill — assim ajuste de tom não vira deploy.
+
 ## [0.1.1] — 2026-08-06
 
 Duas frentes: o servidor deixou de ser só local e passou a rodar compartilhado

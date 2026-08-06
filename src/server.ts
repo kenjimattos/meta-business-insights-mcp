@@ -152,7 +152,7 @@ export function createServer(options: ServerOptions = {}): McpServer {
   const canWrite = options.canWrite ?? false;
   const server = new McpServer({
     name: "meta-business-insights",
-    version: "0.1.1",
+    version: "0.1.2",
   });
 
   /* ------------------------------ portfólio ------------------------------ */
