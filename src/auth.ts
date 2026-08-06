@@ -22,14 +22,19 @@ export interface StaticToken {
   name: string;
   /** SHA-256 do token, para comparar sem manter o segredo em memória crua. */
   digest: Buffer;
+  /** Vazio = só leitura. `["write"]` libera as tools que publicam. */
+  scopes: string[];
 }
 
 /**
- * Lê `MCP_HTTP_TOKENS` no formato `nome:token,nome:token`.
+ * Lê `MCP_HTTP_TOKENS` no formato `nome:token[:write]`, separados por vírgula.
  *
  * O nome é opcional (`token` sozinho vira `token-1`), mas recomendado: sem ele
- * o log não distingue as pessoas. O split é no *primeiro* `:`, então gere
- * tokens sem dois-pontos — `openssl rand -hex 32` serve.
+ * o log não distingue as pessoas. Gere tokens sem dois-pontos —
+ * `openssl rand -hex 32` serve.
+ *
+ * O sufixo `:write` é o que separa quem consulta dados de quem publica em nome
+ * das marcas. Sem ele, as tools de escrita nem aparecem para aquele bearer.
  */
 export function parseTokens(raw: string | undefined): StaticToken[] {
   const entries = (raw ?? "")
@@ -38,15 +43,34 @@ export function parseTokens(raw: string | undefined): StaticToken[] {
     .filter(Boolean);
 
   return entries.map((entry, i) => {
-    const sep = entry.indexOf(":");
-    const name = sep > 0 ? entry.slice(0, sep).trim() : `token-${i + 1}`;
-    const secret = sep > 0 ? entry.slice(sep + 1).trim() : entry;
+    const parts = entry.split(":").map((p) => p.trim());
+
+    let name: string;
+    let secret: string;
+    let suffix: string | undefined;
+
+    if (parts.length === 1) {
+      name = `token-${i + 1}`;
+      secret = parts[0]!;
+    } else {
+      name = parts[0]!;
+      secret = parts[1]!;
+      suffix = parts[2];
+    }
+
     if (!secret) {
       throw new Error(
         `MCP_HTTP_TOKENS: a entrada "${name}" não tem token depois do ":".`,
       );
     }
-    return { name, digest: sha256(secret) };
+    if (parts.length > 3 || (suffix !== undefined && suffix !== "write")) {
+      throw new Error(
+        `MCP_HTTP_TOKENS: entrada "${name}" malformada. ` +
+          `O formato é nome:token ou nome:token:write.`,
+      );
+    }
+
+    return { name, digest: sha256(secret), scopes: suffix ? [suffix] : [] };
   });
 }
 
@@ -79,7 +103,7 @@ export function createStaticTokenVerifier(tokens: StaticToken[]) {
       return {
         token,
         clientId: match.name,
-        scopes: [],
+        scopes: match.scopes,
         expiresAt: Math.floor(Date.now() / 1000) + TOKEN_TTL_SECONDS,
       };
     },
