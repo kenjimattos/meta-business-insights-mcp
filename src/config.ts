@@ -34,6 +34,15 @@ export interface Config {
   dataDir: string;
   /** Restringe o portfólio a estes Page IDs, se definido. */
   pageIdFilter?: string[];
+  /**
+   * Libera as tools que publicam (responder e ocultar comentários).
+   *
+   * Desligado por padrão porque escrita é irreversível na prática: um
+   * comentário publicado em nome do cliente fica visível na hora, e excluir
+   * depois não desfaz quem já leu. No modo HTTP isto é apenas a primeira
+   * tranca — o bearer ainda precisa do sufixo `:write`.
+   */
+  allowWrites: boolean;
 }
 
 function csv(value: string | undefined): string[] | undefined {
@@ -61,5 +70,6 @@ export function loadConfig(): Config {
       process.env.META_DATA_DIR?.trim() ||
       join(homedir(), ".meta-business-insights-mcp"),
     pageIdFilter: csv(process.env.META_PAGE_IDS),
+    allowWrites: /^(1|true|yes)$/i.test(process.env.META_ALLOW_WRITES ?? ""),
   };
 }
