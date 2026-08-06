@@ -19,6 +19,7 @@ import {
   verifyBearerToken,
 } from "@modelcontextprotocol/server";
 
+import { loadConfig } from "./config.js";
 import { createServer } from "./server.js";
 import { createStaticTokenVerifier, parseTokens } from "./auth.js";
 import { toWebRequest, writeNodeResponse } from "./http-bridge.js";
@@ -31,9 +32,18 @@ const mcpPath = process.env.MCP_HTTP_PATH?.trim() || "/mcp";
 // por engano entrega o portfólio inteiro para quem descobrir a URL.
 const verifier = createStaticTokenVerifier(parseTokens(process.env.MCP_HTTP_TOKENS));
 
-const handler = createMcpHandler(createServer, {
-  onerror: (err) => log(`erro do handler: ${err.message}`),
-});
+const { allowWrites } = loadConfig();
+
+// Duas trancas em série para escrita: a instância precisa permitir (variável de
+// ambiente) *e* o bearer daquela pessoa precisa ter o sufixo `:write`. Quem não
+// tem as duas nem enxerga as tools de publicação no tools/list.
+const handler = createMcpHandler(
+  (ctx) =>
+    createServer({
+      canWrite: allowWrites && (ctx.authInfo?.scopes?.includes("write") ?? false),
+    }),
+  { onerror: (err) => log(`erro do handler: ${err.message}`) },
+);
 
 const server = createNodeServer((req, res) => {
   handle(req, res).catch((err) => {

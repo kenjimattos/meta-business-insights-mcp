@@ -7,6 +7,11 @@
 
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 
+import { loadConfig } from "./config.js";
 import { createServer } from "./server.js";
 
-serveStdio(createServer);
+// Sem bearer no stdio: quem controla o processo é quem tem o arquivo de
+// ambiente, então META_ALLOW_WRITES sozinho decide.
+const { allowWrites } = loadConfig();
+
+serveStdio(() => createServer({ canWrite: allowWrites }));

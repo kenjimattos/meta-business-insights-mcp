@@ -121,6 +121,17 @@ function formatMetric(metric: string, value: number | undefined): number | null 
   return MS_METRICS.has(metric) ? Math.round(value / 100) / 10 : value;
 }
 
+/**
+ * Registra escritas em stderr — no modo HTTP isso cai no journal do systemd,
+ * ao lado da linha de request que já identifica quem chamou. Publicar em nome
+ * de um cliente sem deixar rastro não é aceitável.
+ */
+function auditWrite(action: string, detail: Record<string, unknown>): void {
+  process.stderr.write(
+    `[${new Date().toISOString()}] ESCRITA ${action} ${JSON.stringify(detail)}\n`,
+  );
+}
+
 function assetLine(page: PageAsset): string {
   const ig = page.instagram;
   return ig
@@ -128,7 +139,17 @@ function assetLine(page: PageAsset): string {
     : "—";
 }
 
-export function createServer(): McpServer {
+export interface ServerOptions {
+  /**
+   * Registra as tools que publicam. Falso por padrão: quem não recebeu o
+   * direito de escrita não vê essas tools no `tools/list`, em vez de vê-las e
+   * tomar um erro ao usar.
+   */
+  canWrite?: boolean;
+}
+
+export function createServer(options: ServerOptions = {}): McpServer {
+  const canWrite = options.canWrite ?? false;
   const server = new McpServer({
     name: "meta-business-insights",
     version: "0.1.1",
@@ -675,6 +696,116 @@ export function createServer(): McpServer {
       }
     },
   );
+
+  /* -------------------------------- escrita ------------------------------- */
+
+  if (canWrite) {
+    server.registerTool(
+      "reply_comment",
+      {
+        title: "Responder comentário",
+        description:
+          "Publica uma resposta a um comentário, em nome da conta. A resposta é pública e " +
+          "imediata. Sem `confirm: true` a tool apenas devolve a prévia do que seria " +
+          "publicado, sem chamar a API — use isso para revisar o texto antes. " +
+          "Pegue o `commentId` e o `surface` na saída de content_comments.",
+        inputSchema: z.object({
+          asset: z
+            .string()
+            .describe("Página ou conta do Instagram dona da publicação (ID, nome ou @usuario)."),
+          surface: z.enum(["facebook", "instagram"]),
+          commentId: z.string().describe("ID do comentário a responder."),
+          message: z.string().min(1).describe("Texto da resposta."),
+          confirm: z
+            .boolean()
+            .default(false)
+            .describe("Falso devolve a prévia; verdadeiro publica de fato."),
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+      },
+      async ({ asset, surface, commentId, message, confirm }) => {
+        try {
+          const [page] = await portfolio.resolveTargets([asset]);
+          if (!page) return fail(new Error(`Ativo não encontrado: ${asset}`));
+
+          if (!confirm) {
+            return text(
+              `**Prévia — nada foi publicado.**\n\n` +
+                `- Conta: ${surface === "facebook" ? page.name : assetLine(page)}\n` +
+                `- Comentário: \`${commentId}\`\n` +
+                `- Resposta:\n\n> ${message.replace(/\n/g, "\n> ")}\n\n` +
+                `Para publicar, repita com \`confirm: true\`.`,
+              { preview: true, asset: page.name, surface, commentId, message },
+            );
+          }
+
+          // Os dois endpoints diferem: no Facebook a resposta é um comentário
+          // do comentário; no Instagram existe uma edge própria.
+          const path =
+            surface === "facebook"
+              ? `/${commentId}/comments`
+              : `/${commentId}/replies`;
+          const result = await client.post<{ id?: string }>(
+            path,
+            { message },
+            { token: page.accessToken },
+          );
+          auditWrite("reply_comment", {
+            asset: page.name,
+            surface,
+            commentId,
+            replyId: result.id,
+            chars: message.length,
+          });
+
+          return text(
+            `Resposta publicada em ${surface === "facebook" ? page.name : assetLine(page)}.\n\n` +
+              `- Comentário respondido: \`${commentId}\`\n` +
+              `- ID da resposta: \`${result.id ?? "?"}\``,
+            { published: true, surface, commentId, replyId: result.id, message },
+          );
+        } catch (err) {
+          return fail(err);
+        }
+      },
+    );
+
+    server.registerTool(
+      "hide_comment",
+      {
+        title: "Ocultar ou reexibir comentário",
+        description:
+          "Oculta um comentário da publicação (ou o reexibe com `hidden: false`). " +
+          "Ocultar não notifica o autor e mantém o comentário visível para ele — " +
+          "é o caminho usual para spam e golpe, menos abrasivo que excluir.",
+        inputSchema: z.object({
+          asset: z.string(),
+          surface: z.enum(["facebook", "instagram"]),
+          commentId: z.string(),
+          hidden: z.boolean().default(true),
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
+      },
+      async ({ asset, surface, commentId, hidden }) => {
+        try {
+          const [page] = await portfolio.resolveTargets([asset]);
+          if (!page) return fail(new Error(`Ativo não encontrado: ${asset}`));
+
+          const body =
+            surface === "facebook" ? { is_hidden: hidden } : { hide: hidden };
+          await client.post(`/${commentId}`, body, { token: page.accessToken });
+          auditWrite("hide_comment", { asset: page.name, surface, commentId, hidden });
+
+          return text(
+            `Comentário \`${commentId}\` ${hidden ? "ocultado" : "reexibido"}.`,
+            { commentId, hidden, surface },
+          );
+        } catch (err) {
+          return fail(err);
+        }
+      },
+    );
+  }
 
   server.registerTool(
     "list_metrics",
