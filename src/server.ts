@@ -23,7 +23,8 @@ import {
 } from "./graph/insights.js";
 import { fetchFollowerSeries } from "./followers.js";
 import { aggregate, withDeltas, type GroupDimension } from "./aggregate.js";
-import { SnapshotStore, type Snapshot } from "./store.js";
+import { SnapshotStore } from "./store.js";
+import { captureSnapshot } from "./snapshot.js";
 import { resolveRange, today, type Granularity } from "./dates.js";
 import {
   IG_METRICS,
@@ -555,38 +556,11 @@ export function createServer(): McpServer {
     },
     async ({ assets, date }) => {
       try {
-        const pages = await portfolio.resolveTargets(assets);
-        const stamp = date ?? today();
-        const capturedAt = new Date().toISOString();
-        const snapshots: Snapshot[] = [];
-
-        for (const page of pages) {
-          snapshots.push({
-            date: stamp,
-            capturedAt,
-            surface: "facebook",
-            assetId: page.id,
-            assetName: page.name,
-            followers: page.followersCount ?? null,
-          });
-          if (page.instagram) {
-            snapshots.push({
-              date: stamp,
-              capturedAt,
-              surface: "instagram",
-              assetId: page.instagram.id,
-              assetName: page.instagram.username
-                ? `@${page.instagram.username}`
-                : (page.instagram.name ?? page.instagram.id),
-              followers: page.instagram.followersCount ?? null,
-            });
-          }
-        }
-
-        const { written, total } = store.save(snapshots);
+        const result = await captureSnapshot(portfolio, store, { assets, date });
         return text(
-          `Gravados **${written}** snapshots de ${stamp} (${total} no histórico).\n\nArquivo: \`${store.path}\``,
-          { date: stamp, written, total, file: store.path },
+          `Gravados **${result.written}** snapshots de ${result.date} ` +
+            `(${result.total} no histórico).\n\nArquivo: \`${result.file}\``,
+          { ...result },
         );
       } catch (err) {
         return fail(err);
