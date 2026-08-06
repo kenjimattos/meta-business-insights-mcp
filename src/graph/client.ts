@@ -169,6 +169,65 @@ export class GraphClient {
       : new Error(`Falha ao chamar ${path}`);
   }
 
+  /**
+   * POST — escrita (responder comentário, ocultar, etc.).
+   *
+   * **Não faz retry em erro de rede nem em 5xx**, ao contrário do GET. A razão
+   * é que um POST que falha de forma ambígua pode ter sido processado mesmo
+   * assim: repetir publicaria o comentário duas vezes na página do cliente.
+   * Só há retry em rate limit, onde o Meta rejeitou explicitamente e nada
+   * aconteceu do outro lado.
+   */
+  async post<T = unknown>(
+    path: string,
+    body: Params = {},
+    opts: RequestOptions = {},
+  ): Promise<T> {
+    const token = opts.token ?? this.defaultToken;
+    const clean = path.startsWith("/") ? path.slice(1) : path;
+    const url = `${this.base}/${clean}`;
+
+    const form = new URLSearchParams();
+    for (const [key, value] of Object.entries(body)) {
+      if (value === undefined || value === null || value === "") continue;
+      form.set(key, String(value));
+    }
+    form.set("access_token", token);
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body: form.toString(),
+        signal: opts.signal,
+      });
+
+      const text = await res.text();
+      let json: unknown;
+      try {
+        json = text ? JSON.parse(text) : {};
+      } catch {
+        throw new Error(
+          `Resposta não-JSON da Graph API em ${path}: ${text.slice(0, 300)}`,
+        );
+      }
+
+      if (res.ok) return json as T;
+
+      const errBody = (json as { error?: GraphErrorBody }).error ?? {
+        message: text.slice(0, 300),
+      };
+      const error = new GraphError(res.status, path, errBody);
+      if (!error.isRateLimit || attempt === 3) throw error;
+      await sleep(5_000 * 2 ** (attempt - 1));
+    }
+
+    throw new Error(`Falha ao escrever em ${path}`);
+  }
+
   /** GET seguindo paginação por cursor e concatenando `data`. */
   async getAll<T = unknown>(
     path: string,
