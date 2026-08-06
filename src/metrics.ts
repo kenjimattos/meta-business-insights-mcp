@@ -246,6 +246,66 @@ export const IG_DEPRECATIONS: Record<string, string> = {
  */
 export const IG_TIME_SERIES_METRICS = new Set(["reach", "follower_count"]);
 
+/* ------------------------- métricas por publicação ------------------------ */
+
+/**
+ * Insights de publicação do Instagram, separados por `media_product_type`.
+ *
+ * A separação é obrigatória, não organizacional: pedir uma métrica que o tipo
+ * não aceita derruba o request inteiro com `(#100) The Media Insights API does
+ * not support the metric`. Verificado na v26 — um reel aceita watch time mas
+ * não profile_visits, e um post de feed é exatamente o oposto.
+ */
+const IG_MEDIA_COMMON = [
+  "reach",
+  "likes",
+  "comments",
+  "shares",
+  "saved",
+  "total_interactions",
+  "views",
+];
+
+export const IG_MEDIA_METRICS_BY_TYPE: Record<string, string[]> = {
+  REELS: [...IG_MEDIA_COMMON, "ig_reels_avg_watch_time", "ig_reels_video_view_total_time"],
+  FEED: [...IG_MEDIA_COMMON, "profile_visits", "follows", "profile_activity"],
+};
+
+/**
+ * Tipos não mapeados (STORY, AD…) recebem só o conjunto comum. É a escolha
+ * conservadora: métricas específicas de story não foram verificadas contra a
+ * API, e chutar uma quebraria a consulta inteira daquele tipo.
+ */
+export function igMediaMetricsFor(productType: string | undefined): string[] {
+  return IG_MEDIA_METRICS_BY_TYPE[productType ?? ""] ?? IG_MEDIA_COMMON;
+}
+
+/**
+ * Insights de post do Facebook. Diferente do Instagram, aqui um único conjunto
+ * serve para todos os tipos: métricas de vídeo pedidas num post de foto voltam
+ * vazias em vez de dar erro (verificado na v26).
+ *
+ * `post_impressions`, `post_impressions_unique` e `post_engaged_users` foram
+ * desligadas — respondem `(#100) The value must be a valid insights metric`.
+ */
+export const FB_POST_METRICS = [
+  "post_media_view",
+  "post_reactions_by_type_total",
+  "post_clicks",
+  "post_activity_by_action_type",
+  "post_video_views",
+  "post_video_avg_time_watched",
+  "post_video_view_time",
+];
+
+/** Métricas cujo valor vem em milissegundos e precisa virar segundos ao exibir. */
+export const MS_METRICS = new Set([
+  "ig_reels_avg_watch_time",
+  "ig_reels_video_view_total_time",
+  "post_video_avg_time_watched",
+  "post_video_view_time",
+]);
+
 /** Métricas do Instagram que exigem o parâmetro `timeframe`. */
 export const IG_REQUIRES_TIMEFRAME = new Set([
   "follower_demographics",
