@@ -16,7 +16,8 @@
     "start": "node dist/index.js",
     "start:http": "node dist/http.js",
     "typecheck": "tsc --noEmit",
-    "probe": "node dist/probe.js"
+    "probe": "node dist/probe.js",
+    "snapshot": "node dist/snapshot-cli.js"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "^2.0.0",
