@@ -36,8 +36,32 @@ cp .env.example .env
 
 ### Permissões necessárias no token
 
-`pages_read_engagement`, `pages_show_list`, `read_insights`, `instagram_basic`,
-`instagram_manage_insights` e `business_management`.
+| Permissão | Para quê |
+| --- | --- |
+| `pages_show_list` | descobrir as Páginas do portfólio |
+| `pages_read_engagement` | Page Access Token real e publicações da Página |
+| `pages_read_user_content` | comentários de terceiros no Facebook |
+| `read_insights` | insights de Página e de publicação |
+| `instagram_basic` | mídias e legendas do Instagram |
+| `instagram_manage_insights` | insights do Instagram |
+| `instagram_manage_comments` | comentários do Instagram |
+
+`business_management` é opcional: habilita a descoberta via
+`/{business}/owned_pages`, mas o fallback por `/me/accounts` encontra as mesmas
+Páginas.
+
+**Tasks por Página**, atribuídas ao System User em Configurações do negócio:
+`Atividade da comunidade` (MODERATE) e `Insights` (ANALYZE). Verificado — não é
+preciso acesso total nem tarefas de criação de conteúdo.
+
+Duas armadilhas aqui, ambas custaram tempo:
+
+Um token existente **não ganha permissões novas**. Depois de habilitar qualquer
+uma, gere um token novo e substitua o antigo.
+
+A permissão no token **só vale onde há atribuição de ativo**. Sem a Página
+atribuída ao System User com as tasks acima, a permissão existe e não funciona —
+e o erro (`(#190)`, `A Page access token is required`) não sugere a causa.
 
 Valide tudo antes de plugar no Claude:
 
@@ -254,6 +278,8 @@ Vale ter explícito, porque é fácil descobrir tarde:
 | `followers_timeseries` | Seguidores por mês/semana/dia: ganhos, perdidos, saldo e total acumulado |
 | `page_insights` | Métricas de Page Insights com agregação livre |
 | `instagram_insights` | Métricas de Instagram Insights com agregação livre |
+| `content_insights` | Desempenho por publicação: curtidas, salvamentos, comentários, tempo de visualização |
+| `content_comments` | Comentários das publicações, com filtro por palavra |
 | `list_metrics` | Catálogo de métricas válidas + mapa das descontinuadas |
 | `save_followers_snapshot` | Grava o total de seguidores no histórico local |
 | `snapshot_history` | Lê o histórico local acumulado |
@@ -309,6 +335,50 @@ um número.
 guarda ~2 anos. Gravando um snapshot dos totais todo dia, o portfólio acumula um
 histórico próprio que não depende da janela do Meta nem das deprecações de métrica.
 Veja [Snapshot diário](#snapshot-diário).
+
+## Desempenho por publicação e comentários
+
+`content_insights` e `content_comments` trabalham numa dimensão diferente do
+resto do servidor: a linha é uma **publicação**, não um período. Por isso não
+passam pela camada de agregação — o que se quer ali é ordenar e cortar ("os 10
+com mais salvamentos"), não somar por mês.
+
+**As duas redes não contam a mesma coisa.** A tabela traz um conjunto
+normalizado para permitir comparação, mas com duas ressalvas que mudam a
+leitura:
+
+| Coluna | Facebook | Instagram |
+| --- | --- | --- |
+| Curtidas | **todas as reações** (like + amei + haha…) | curtidas |
+| Salvos | não existe | `saved` |
+| Views | `post_media_view` | `views` |
+| Interações | soma de `post_activity_by_action_type` | `total_interactions` |
+
+Para o detalhe cru, `sortBy` também aceita o nome original da API (`reach`,
+`post_clicks`, `ig_reels_avg_watch_time`), e a métrica pedida vira uma coluna
+extra. O `structuredContent` sempre traz todas as métricas brutas.
+
+**Tempo de visualização vem em milissegundos** na Graph API, enquanto o Business
+Suite mostra segundos. As colunas de tempo são convertidas na exibição — sem
+isso, o relatório erraria por um fator de mil.
+
+**Métricas por publicação não são intercambiáveis entre tipos** no Instagram: um
+reel aceita `ig_reels_avg_watch_time` mas não `profile_visits`, e um post de feed
+é o oposto. Pedir a métrica errada derruba o request inteiro com `(#100)`, então
+as consultas são agrupadas por `media_product_type`. O Facebook é tolerante —
+métrica de vídeo num post de foto volta vazia em vez de dar erro.
+
+### Comentários
+
+Exigem permissões que os insights não pedem: `pages_read_user_content` e
+`instagram_manage_comments`. Conteúdo publicado pela marca e conteúdo escrito
+por terceiros são coisas separadas para o Meta.
+
+O Instagram informa o `@usuario` de quem comentou; o **Facebook quase sempre
+não** — só perfis que consentiram ou Páginas aparecem identificados, o resto
+volta sem autor. O filtro `contains` serve para rastrear um problema específico
+("não consigo", "estorno", "cobrança") através de todas as publicações do
+período.
 
 ## Métricas descontinuadas
 
