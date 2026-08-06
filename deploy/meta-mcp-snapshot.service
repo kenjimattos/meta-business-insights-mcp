@@ -1,0 +1,34 @@
+# /etc/systemd/system/meta-mcp-snapshot.service
+#
+# Acionado pelo .timer; não precisa de `enable`. Para rodar sob demanda:
+#   systemctl start meta-mcp-snapshot
+#   journalctl -u meta-mcp-snapshot -n 20
+
+[Unit]
+Description=Snapshot de seguidores (Meta Business Insights)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=mcp
+Group=mcp
+WorkingDirectory=/opt/meta-business-insights-mcp
+ExecStart=/usr/bin/node dist/snapshot-cli.js
+EnvironmentFile=/etc/meta-mcp.env
+
+# Mesmo diretório do serviço principal — os dois escrevem o mesmo arquivo de
+# histórico, então StateDirectory e User precisam bater.
+StateDirectory=meta-mcp
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true

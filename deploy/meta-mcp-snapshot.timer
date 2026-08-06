@@ -1,0 +1,22 @@
+# /etc/systemd/system/meta-mcp-snapshot.timer
+#
+# systemctl daemon-reload && systemctl enable --now meta-mcp-snapshot.timer
+# systemctl list-timers meta-mcp-snapshot   # confirma o próximo disparo
+
+[Unit]
+Description=Snapshot diário de seguidores do portfólio
+
+[Timer]
+OnCalendar=daily
+
+# Se a VPS estiver desligada na hora marcada, roda assim que voltar. Sem isso,
+# um reboot no horário errado abriria um buraco permanente na série — a API do
+# Instagram não permite recuperar o passado.
+Persistent=true
+
+# Espalha o disparo dentro de uma janela de 1h. Evita bater na Graph API no
+# mesmo segundo que todo mundo que usa OnCalendar=daily.
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target
