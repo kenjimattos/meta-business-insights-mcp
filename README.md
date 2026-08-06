@@ -136,7 +136,38 @@ systemctl daemon-reload && systemctl enable --now meta-mcp
 journalctl -u meta-mcp -f
 ```
 
-### 3. TLS
+### 3. Snapshot diário
+
+A janela de `follower_count` do Instagram é de **30 dias**. O que não for
+capturado dentro dela não existe em lugar nenhum depois — não há como pedir ao
+Meta o total de seguidores de seis meses atrás. O histórico longo só passa a
+existir a partir do dia em que você começa a acumulá-lo.
+
+```bash
+cp deploy/meta-mcp-snapshot.service deploy/meta-mcp-snapshot.timer /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now meta-mcp-snapshot.timer
+systemctl start meta-mcp-snapshot          # roda uma vez agora, para conferir
+journalctl -u meta-mcp-snapshot -n 5 --no-pager
+systemctl list-timers meta-mcp-snapshot
+```
+
+O log deve trazer uma linha como
+`snapshot 2026-08-06: 6 ativos gravados, 12 no histórico`.
+
+O timer usa `Persistent=true`: se a VPS estiver desligada na hora marcada, ele
+roda assim que ela volta. Sem isso, um reboot no horário errado abriria um
+buraco permanente na série.
+
+O mesmo CLI serve para rodar à mão, inclusive para uma data específica:
+
+```bash
+npm run snapshot -- --date 2026-08-06 --assets @programa_dotz
+```
+
+Depois é a tool `snapshot_history` que lê essa série pelo Claude.
+
+### 4. TLS
 
 Aponte um subdomínio para o IP da VPS, ajuste o host no
 [deploy/Caddyfile](deploy/Caddyfile) e copie para `/etc/caddy/Caddyfile`. O
@@ -160,7 +191,7 @@ curl -X POST https://mcp.exemplo.com/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
-### 4. Conectar o Claude Desktop de cada pessoa
+### 5. Conectar o Claude Desktop de cada pessoa
 
 Duas formas, porque a interface de conectores do Claude só tem campos de OAuth
 — não há campo para um bearer fixo.
@@ -275,9 +306,9 @@ reconstrução para no primeiro buraco e devolve `—` dali para trás, em vez d
 um número.
 
 **Snapshots locais.** `follower_count` do Instagram só volta 30 dias e Page Insights
-guarda ~2 anos. Rodando `save_followers_snapshot` periodicamente (um cron, ou um
-`/loop` no Claude Code), o portfólio acumula um histórico próprio que não depende da
-janela do Meta nem das deprecações de métrica.
+guarda ~2 anos. Gravando um snapshot dos totais todo dia, o portfólio acumula um
+histórico próprio que não depende da janela do Meta nem das deprecações de métrica.
+Veja [Snapshot diário](#snapshot-diário).
 
 ## Métricas descontinuadas
 
