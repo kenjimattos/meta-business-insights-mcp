@@ -24,25 +24,53 @@ import {
 
 import { loadConfig } from "./config.js";
 import { createServer } from "./server.js";
-import { createStaticTokenVerifier, parseTokens } from "./auth.js";
+import { createStaticTokenVerifier, parseAllowedEmails, parseTokens } from "./auth.js";
 import { toWebRequest, writeNodeResponse } from "./http-bridge.js";
+import { loadGoogleConfig } from "./google.js";
 import { AuthorizationServer, loadOAuthConfig } from "./oauth.js";
 
 const port = Number(process.env.MCP_HTTP_PORT ?? 8787);
 const host = process.env.MCP_HTTP_HOST?.trim() || "127.0.0.1";
 const mcpPath = process.env.MCP_HTTP_PATH?.trim() || "/mcp";
 
-// Falha ao subir, e não na primeira requisição: um servidor sem token exposto
-// por engano entrega o portfólio inteiro para quem descobrir a URL.
 const tokens = parseTokens(process.env.MCP_HTTP_TOKENS);
 const staticVerifier = createStaticTokenVerifier(tokens);
+const allowedUsers = parseAllowedEmails(process.env.MCP_ALLOWED_EMAILS);
 
 const { allowWrites, dataDir } = loadConfig();
 
 // OAuth é opcional: sem MCP_OAUTH_ISSUER o servidor segue só com bearer
 // estático, do jeito que a ponte local espera.
 const oauthConfig = loadOAuthConfig(dataDir);
-const oauth = oauthConfig ? new AuthorizationServer(oauthConfig, tokens, log) : undefined;
+const googleConfig = oauthConfig ? loadGoogleConfig(oauthConfig.issuer) : undefined;
+
+// Todas as validações de configuração falham aqui, no boot, e não na primeira
+// requisição: um servidor exposto por engano entrega o portfólio inteiro para
+// quem descobrir a URL.
+if (oauthConfig && !googleConfig) {
+  throw new Error(
+    "MCP_OAUTH_ISSUER definido, mas o login Google não está configurado. " +
+      "Defina GOOGLE_CLIENT_ID e GOOGLE_CLIENT_SECRET.",
+  );
+}
+if (googleConfig && allowedUsers.length === 0) {
+  throw new Error(
+    "MCP_ALLOWED_EMAILS está vazio. Sem a allowlist, qualquer conta do " +
+      "domínio entraria — defina quem do time pode usar o servidor.",
+  );
+}
+if (tokens.length === 0 && !googleConfig) {
+  throw new Error(
+    "Nenhuma forma de autenticação configurada. Defina MCP_ALLOWED_EMAILS " +
+      "com o login Google (MCP_OAUTH_ISSUER + GOOGLE_CLIENT_*), ou " +
+      "MCP_HTTP_TOKENS — sem isso qualquer pessoa com a URL lê o portfólio.",
+  );
+}
+
+const oauth =
+  oauthConfig && googleConfig
+    ? new AuthorizationServer(oauthConfig, googleConfig, allowedUsers, log)
+    : undefined;
 
 const authMetadata = oauthConfig
   ? {
@@ -58,9 +86,10 @@ const resourceMetadataUrl = authMetadata
   : undefined;
 
 /**
- * Aceita as duas credenciais. A sessão OAuth é o caminho novo; o bearer
- * estático cru continua valendo para a ponte `mcp-remote` e para o `curl` de
- * diagnóstico. Tenta o estático primeiro por ser o mais barato.
+ * Aceita as duas credenciais. A sessão OAuth vinda do login Google é o caminho
+ * normal; o bearer estático cru continua valendo como saída de emergência —
+ * o `curl` de diagnóstico e a ponte `mcp-remote`. Tenta o estático primeiro
+ * por ser o mais barato.
  */
 async function verifyAccessToken(token: string): Promise<AuthInfo> {
   try {
@@ -154,6 +183,8 @@ function isOAuthPath(pathname: string): boolean {
   return (
     pathname === "/authorize" ||
     pathname === "/token" ||
+    pathname === "/register" ||
+    pathname === "/oauth/google/callback" ||
     pathname.startsWith("/.well-known/")
   );
 }
