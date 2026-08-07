@@ -1,26 +1,24 @@
 /**
- * Authorization server mínimo, para que o conector do Claude funcione no
- * celular e no claude.ai.
+ * Authorization server do conector, com login pelo Google.
  *
- * O que ele *não* faz: não fala com o Meta e não cria identidade nova. O
- * `META_ACCESS_TOKEN` continua sendo um só, na VPS, e os bearers pessoais de
- * `MCP_HTTP_TOKENS` continuam sendo a credencial — a diferença é que agora a
- * pessoa digita o dela uma vez numa página deste servidor, em vez de colar num
- * arquivo de configuração local. O Claude sai dali com uma sessão OAuth e
- * renova sozinho.
+ * O que ele resolve: a janela "Add custom connector" do Claude não tem campo
+ * para bearer fixo, e a ponte `mcp-remote` roda na máquina de quem usa — no
+ * celular não há máquina. Um conector remoto com OAuth vive na conta, então
+ * aparece no Desktop, no claude.ai e no app de uma vez só.
  *
- * Por que isso destrava o celular: a ponte `mcp-remote` roda na máquina de
- * quem usa, e no telefone não há máquina. Um conector remoto com OAuth vive na
- * conta, não no aparelho.
+ * O que ele deliberadamente *não* faz: não fala com a Graph API e não decide o
+ * que a pessoa alcança no Meta. O `META_ACCESS_TOKEN` continua único, na VPS. O
+ * Google entra uma vez, no login, só para dizer quem é a pessoa; a
+ * `MCP_ALLOWED_EMAILS` diz se ela entra. Nenhum segredo é distribuído para
+ * ninguém.
  *
- * Cada sessão fica amarrada ao *digest* do token estático que a originou, não
- * ao nome. Assim revogar continua sendo apagar a linha de `MCP_HTTP_TOKENS` e
- * reiniciar: as sessões daquela pessoa morrem junto, sem varredura manual.
- * Trocar o token de alguém tem o mesmo efeito, de graça.
+ * Revogação continua sendo apagar uma linha e reiniciar: as sessões são
+ * ancoradas no e-mail e o boot descarta as que não estão mais na allowlist —
+ * access token e refresh token juntos.
  *
- * Não há `registration_endpoint` de propósito. O Claude aceita client_id e
- * client_secret fixos nos campos avançados de "Add custom connector", o que
- * dispensa Dynamic Client Registration e um endpoint a menos para proteger.
+ * O cliente se registra sozinho (RFC 7591), que é o que permite deixar os
+ * campos avançados da janela em branco. A pessoa preenche dois campos: nome e
+ * URL.
  */
 
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
@@ -34,7 +32,13 @@ import {
   type OAuthMetadata,
 } from "@modelcontextprotocol/server";
 
-import { sha256, type StaticToken } from "./auth.js";
+import { sha256, type AllowedUser } from "./auth.js";
+import {
+  exchangeGoogleCode,
+  googleAuthorizationUrl,
+  GoogleLoginError,
+  type GoogleConfig,
+} from "./google.js";
 
 /** Vida do access token. Curto porque o refresh é automático e invisível. */
 const ACCESS_TTL_SECONDS = 3600;
@@ -42,84 +46,72 @@ const ACCESS_TTL_SECONDS = 3600;
 /** Vida do código de autorização. O Claude troca em segundos; 10 min é folga. */
 const CODE_TTL_MS = 10 * 60_000;
 
-/**
- * Callbacks aceitos por padrão. O Claude web e o app usam os dois primeiros; o
- * Desktop abre um servidor local em porta variável, tratado à parte por ser
- * loopback (RFC 8252).
- */
-const DEFAULT_REDIRECT_URIS = [
-  "https://claude.ai/api/mcp/auth_callback",
-  "https://claude.com/api/mcp/auth_callback",
-];
+/** Janela para a pessoa escolher a conta no Google e voltar. */
+const PENDING_TTL_MS = 10 * 60_000;
+
+/** Teto de clientes guardados, para o `/register` público não crescer sem fim. */
+const MAX_CLIENTS = 500;
+
+/** Teto do corpo do `/register`, pelo mesmo motivo. */
+const MAX_REGISTRATION_BYTES = 16 * 1024;
 
 export interface OAuthConfig {
   /** URL pública do servidor, sem barra final. Vira o `issuer`. */
   issuer: string;
-  clientId: string;
-  clientSecret: string;
-  /** Allowlist exata de redirect_uri, além do loopback. */
-  redirectUris: string[];
-  /** Arquivo onde as sessões sobrevivem ao restart. */
+  clientsFile: string;
   sessionFile: string;
 }
 
-/**
- * Lê a configuração do ambiente. Devolve `undefined` quando `MCP_OAUTH_ISSUER`
- * não está definido — sem isso o servidor segue exatamente como antes, só com
- * bearer estático, e nada quebra para quem já usa a ponte local.
- */
 export function loadOAuthConfig(dataDir: string): OAuthConfig | undefined {
   const issuer = process.env.MCP_OAUTH_ISSUER?.trim().replace(/\/+$/, "");
   if (!issuer) return undefined;
 
-  const clientId = process.env.MCP_OAUTH_CLIENT_ID?.trim();
-  const clientSecret = process.env.MCP_OAUTH_CLIENT_SECRET?.trim();
-
-  // Falha ao subir, não na primeira tentativa de login: um issuer anunciado
-  // sem cliente configurado deixa a equipe travada numa tela de erro do Claude
-  // que não diz o que houve.
-  if (!clientId || !clientSecret) {
-    throw new Error(
-      "MCP_OAUTH_ISSUER definido, mas MCP_OAUTH_CLIENT_ID e/ou " +
-        "MCP_OAUTH_CLIENT_SECRET estão vazios. Gere os dois com " +
-        "`openssl rand -hex 16` e `openssl rand -hex 32`.",
-    );
-  }
   if (!issuer.startsWith("https://") && !issuer.startsWith("http://localhost")) {
     throw new Error(
       `MCP_OAUTH_ISSUER precisa ser https:// (recebido: ${issuer}). ` +
-        "Sem TLS o token pessoal viaja em texto claro no POST do /authorize.",
+        "O Google recusa redirect_uri sem TLS, e o código de autorização " +
+        "viajaria em texto claro.",
     );
   }
 
-  const extra = (process.env.MCP_OAUTH_REDIRECT_URIS ?? "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-
   return {
     issuer,
-    clientId,
-    clientSecret,
-    redirectUris: [...DEFAULT_REDIRECT_URIS, ...extra],
+    clientsFile: join(dataDir, "oauth-clients.json"),
     sessionFile: join(dataDir, "oauth-sessions.json"),
   };
 }
 
-interface Session {
-  /** Rótulo da pessoa, herdado do MCP_HTTP_TOKENS. Só para log. */
+interface RegisteredClient {
+  clientId: string;
+  /** Digest do segredo, ou `null` para cliente público (só PKCE). */
+  secretDigest: string | null;
+  redirectUris: string[];
   name: string;
-  /** Digest do token estático que autorizou. A âncora da revogação. */
-  staticDigest: string;
+  createdAt: number;
+}
+
+interface Session {
+  email: string;
+  clientId: string;
   accessDigest: string;
   accessExpiresAt: number;
   refreshDigest: string;
 }
 
 interface PendingCode {
-  staticDigest: string;
-  name: string;
+  email: string;
+  clientId: string;
   redirectUri: string;
+  challenge: string;
+  expiresAt: number;
+}
+
+/** Pedido do Claude parado enquanto a pessoa escolhe a conta no Google. */
+interface PendingAuthorization {
+  clientId: string;
+  redirectUri: string;
+  /** O `state` do Claude — diferente do nosso, que vai para o Google. */
+  clientState: string;
   challenge: string;
   expiresAt: number;
 }
@@ -132,67 +124,95 @@ function randomToken(): string {
   return randomBytes(32).toString("base64url");
 }
 
-/** Comparação de segredos em tempo constante, tolerante a tamanhos diferentes. */
-function secretEquals(a: string, b: string): boolean {
-  return timingSafeEqual(sha256(a), sha256(b));
+/**
+ * Arquivo JSON com escrita atômica (tmp + rename) e modo 0600.
+ *
+ * O rename importa: o restart do systemd pode cair no meio de um flush, e um
+ * JSON truncado deslogaria a equipe inteira.
+ */
+function persistJson(file: string, data: unknown): void {
+  mkdirSync(dirname(file), { recursive: true });
+  const tmp = `${file}.tmp`;
+  writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600 });
+  renameSync(tmp, file);
+}
+
+function readJson<T>(file: string, fallback: T): T {
+  try {
+    return JSON.parse(readFileSync(file, "utf8")) as T;
+  } catch {
+    // Ausente ou corrompido: começar vazio custa um login novo, enquanto
+    // abortar o boot deixaria o servidor fora do ar.
+    return fallback;
+  }
 }
 
 /**
- * Sessões em memória, espelhadas em disco.
- *
- * O arquivo guarda só digests — vazar o backup não devolve nenhum token
- * utilizável. A escrita é atômica (tmp + rename) porque o restart do systemd
- * pode cair no meio de um flush e um JSON truncado deslogaria a equipe.
+ * Clientes registrados. Precisa persistir: o Claude registra uma vez e guarda o
+ * `client_id` na conta — se a lista sumisse no restart, todo mundo cairia num
+ * `invalid_client` sem forma de se recuperar sozinho.
  */
-class SessionStore {
-  private sessions: Session[] = [];
+class ClientStore {
+  private clients: RegisteredClient[];
 
   constructor(private readonly file: string) {
-    try {
-      const raw = readFileSync(file, "utf8");
-      const parsed = JSON.parse(raw) as { sessions?: Session[] };
-      this.sessions = parsed.sessions ?? [];
-    } catch {
-      // Arquivo ausente ou corrompido: começar vazio custa um login novo,
-      // enquanto abortar o boot deixaria o servidor fora do ar.
-      this.sessions = [];
-    }
+    this.clients = readJson<{ clients?: RegisteredClient[] }>(file, {}).clients ?? [];
   }
 
-  private persist(): void {
-    mkdirSync(dirname(this.file), { recursive: true });
-    const tmp = `${this.file}.tmp`;
-    writeFileSync(tmp, JSON.stringify({ sessions: this.sessions }, null, 2), {
-      mode: 0o600,
-    });
-    renameSync(tmp, this.file);
+  find(clientId: string): RegisteredClient | undefined {
+    return this.clients.find((c) => c.clientId === clientId);
+  }
+
+  add(client: RegisteredClient): void {
+    this.clients.push(client);
+    // O `/register` é público por especificação. Descartar o mais antigo é
+    // preferível a recusar registros novos para sempre depois de um abuso.
+    if (this.clients.length > MAX_CLIENTS) {
+      this.clients.sort((a, b) => a.createdAt - b.createdAt);
+      this.clients = this.clients.slice(this.clients.length - MAX_CLIENTS);
+    }
+    persistJson(this.file, { clients: this.clients });
+  }
+}
+
+/**
+ * Sessões em memória, espelhadas em disco. O arquivo guarda só digests — vazar
+ * o backup não devolve nenhum token utilizável.
+ */
+class SessionStore {
+  private sessions: Session[];
+
+  constructor(private readonly file: string) {
+    this.sessions = readJson<{ sessions?: Session[] }>(file, {}).sessions ?? [];
   }
 
   /**
-   * Descarta sessões órfãs: aquelas cujo token estático saiu do
-   * `MCP_HTTP_TOKENS`. Rodada no boot, é o que transforma "apagar a linha e
-   * reiniciar" em revogação de verdade, inclusive do refresh token.
+   * Descarta sessões de quem saiu da allowlist. Rodada no boot, é o que
+   * transforma "apagar a linha e reiniciar" em revogação de verdade, inclusive
+   * do refresh token.
    *
    * Sessões com access token vencido ficam — o refresh não expira, e é ele que
    * evita que a equipe refaça login toda hora.
    */
-  prune(live: Set<string>): void {
+  prune(allowed: Set<string>): number {
     const before = this.sessions.length;
-    this.sessions = this.sessions.filter((s) => live.has(s.staticDigest));
-    if (this.sessions.length !== before) this.persist();
+    this.sessions = this.sessions.filter((s) => allowed.has(s.email));
+    const removed = before - this.sessions.length;
+    if (removed > 0) persistJson(this.file, { sessions: this.sessions });
+    return removed;
   }
 
-  create(name: string, staticDigest: string): { access: string; refresh: string } {
+  create(email: string, clientId: string): { access: string; refresh: string } {
     const access = randomToken();
     const refresh = randomToken();
     this.sessions.push({
-      name,
-      staticDigest,
+      email,
+      clientId,
       accessDigest: hex(access),
       accessExpiresAt: Date.now() + ACCESS_TTL_SECONDS * 1000,
       refreshDigest: hex(refresh),
     });
-    this.persist();
+    persistJson(this.file, { sessions: this.sessions });
     return { access, refresh };
   }
 
@@ -211,22 +231,28 @@ class SessionStore {
     const access = randomToken();
     session.accessDigest = hex(access);
     session.accessExpiresAt = Date.now() + ACCESS_TTL_SECONDS * 1000;
-    this.persist();
+    persistJson(this.file, { sessions: this.sessions });
     return access;
   }
 }
 
 export class AuthorizationServer {
-  private readonly store: SessionStore;
+  private readonly clients: ClientStore;
+  private readonly sessions: SessionStore;
   private readonly codes = new Map<string, PendingCode>();
+  private readonly pending = new Map<string, PendingAuthorization>();
 
   constructor(
     private readonly config: OAuthConfig,
-    private readonly tokens: StaticToken[],
+    private readonly google: GoogleConfig,
+    private readonly users: AllowedUser[],
     private readonly log: (message: string) => void,
   ) {
-    this.store = new SessionStore(config.sessionFile);
-    this.store.prune(new Set(tokens.map((t) => t.digest.toString("hex"))));
+    this.clients = new ClientStore(config.clientsFile);
+    this.sessions = new SessionStore(config.sessionFile);
+
+    const removed = this.sessions.prune(new Set(users.map((u) => u.email)));
+    if (removed > 0) log(`${removed} sessão(ões) descartada(s): fora da allowlist`);
   }
 
   /** Documento RFC 8414, servido pelo helper do SDK em `http.ts`. */
@@ -235,6 +261,8 @@ export class AuthorizationServer {
       issuer: this.config.issuer,
       authorization_endpoint: `${this.config.issuer}/authorize`,
       token_endpoint: `${this.config.issuer}/token`,
+      // É o que permite deixar Client ID e Secret em branco na janela.
+      registration_endpoint: `${this.config.issuer}/register`,
       response_types_supported: ["code"],
       grant_types_supported: ["authorization_code", "refresh_token"],
       // Só S256: `plain` não protege contra interceptação do código.
@@ -242,6 +270,7 @@ export class AuthorizationServer {
       token_endpoint_auth_methods_supported: [
         "client_secret_post",
         "client_secret_basic",
+        "none",
       ],
       scopes_supported: ["write"],
     };
@@ -249,39 +278,31 @@ export class AuthorizationServer {
 
   /**
    * Verificador do `/mcp` para sessões OAuth. `http.ts` encadeia este com o de
-   * bearer estático, para não quebrar quem já usa a ponte local nem o `curl`
-   * de diagnóstico do README.
+   * bearer estático, que segue valendo como saída de emergência.
    */
   verifyAccessToken = async (token: string): Promise<AuthInfo> => {
-    const session = this.store.findByAccess(token);
+    const session = this.sessions.findByAccess(token);
     if (!session) throw new OAuthError(OAuthErrorCode.InvalidToken, "Token inválido.");
 
     if (session.accessExpiresAt <= Date.now()) {
       throw new OAuthError(OAuthErrorCode.InvalidToken, "Sessão expirada.");
     }
 
-    // Relê os scopes da lista viva em vez de congelá-los na sessão: adicionar
-    // `:write` para alguém passa a valer no próximo restart, sem relogin.
-    const owner = this.findStatic(session.staticDigest);
-    if (!owner) {
-      throw new OAuthError(OAuthErrorCode.InvalidToken, "Acesso revogado.");
-    }
+    // Relê os scopes da lista viva em vez de congelá-los na sessão: conceder
+    // `:write` a alguém passa a valer no próximo restart, sem relogin.
+    const user = this.findUser(session.email);
+    if (!user) throw new OAuthError(OAuthErrorCode.InvalidToken, "Acesso revogado.");
 
     return {
       token,
-      clientId: owner.name,
-      scopes: owner.scopes,
+      clientId: user.email,
+      scopes: user.scopes,
       expiresAt: Math.floor(session.accessExpiresAt / 1000),
     };
   };
 
-  private findStatic(digest: string): StaticToken | undefined {
-    return this.tokens.find((t) => t.digest.toString("hex") === digest);
-  }
-
-  private matchStatic(secret: string): StaticToken | undefined {
-    const digest = sha256(secret);
-    return this.tokens.find((t) => timingSafeEqual(t.digest, digest));
+  private findUser(email: string): AllowedUser | undefined {
+    return this.users.find((u) => u.email === email);
   }
 
   /**
@@ -289,10 +310,20 @@ export class AuthorizationServer {
    * para `http.ts` seguir com o roteamento normal.
    */
   async handle(request: Request, url: URL): Promise<Response | undefined> {
+    if (url.pathname === "/register") {
+      if (request.method === "OPTIONS") return preflight("POST");
+      if (request.method !== "POST") return methodNotAllowed("POST");
+      return this.register(request);
+    }
+
     if (url.pathname === "/authorize") {
-      if (request.method === "GET") return this.authorizeForm(url);
-      if (request.method === "POST") return this.authorizeSubmit(request);
-      return methodNotAllowed("GET, POST");
+      if (request.method !== "GET") return methodNotAllowed("GET");
+      return this.authorize(url);
+    }
+
+    if (url.pathname === "/oauth/google/callback") {
+      if (request.method !== "GET") return methodNotAllowed("GET");
+      return this.googleCallback(url);
     }
 
     if (url.pathname === "/token") {
@@ -304,102 +335,205 @@ export class AuthorizationServer {
     return undefined;
   }
 
-  /** Valida os parâmetros e devolve a tela onde a pessoa cola o token dela. */
-  private authorizeForm(url: URL): Response {
-    const params = url.searchParams;
-    const redirectUri = params.get("redirect_uri") ?? "";
-    const clientId = params.get("client_id") ?? "";
+  /** Dynamic Client Registration (RFC 7591). */
+  private async register(request: Request): Promise<Response> {
+    const raw = await request.text();
+    if (raw.length > MAX_REGISTRATION_BYTES) {
+      return oauthError("invalid_client_metadata", "Corpo grande demais.");
+    }
 
-    // redirect_uri e client_id inválidos nunca podem virar redirect: seria um
+    let metadata: {
+      redirect_uris?: unknown;
+      client_name?: unknown;
+      token_endpoint_auth_method?: unknown;
+    };
+    try {
+      metadata = JSON.parse(raw);
+    } catch {
+      return oauthError("invalid_client_metadata", "JSON inválido.");
+    }
+
+    const redirectUris = Array.isArray(metadata.redirect_uris)
+      ? metadata.redirect_uris.filter((u): u is string => typeof u === "string")
+      : [];
+
+    if (redirectUris.length === 0) {
+      return oauthError("invalid_redirect_uri", "redirect_uris é obrigatório.");
+    }
+    // Mesmo critério do /authorize: https, ou loopback (o Desktop abre um
+    // servidor efêmero em porta variável, RFC 8252).
+    const invalid = redirectUris.find((u) => !isUsableRedirect(u));
+    if (invalid) {
+      return oauthError("invalid_redirect_uri", `redirect_uri inválido: ${invalid}`);
+    }
+
+    // Cliente público declara `none` e se autentica só por PKCE. Guardar o que
+    // ele declarou é melhor do que apostar num comportamento do Claude: o
+    // /token passa a exigir de cada cliente exatamente o que ele prometeu.
+    const isPublic = metadata.token_endpoint_auth_method === "none";
+    const clientId = randomToken();
+    const secret = isPublic ? undefined : randomToken();
+    const name =
+      typeof metadata.client_name === "string" && metadata.client_name.trim()
+        ? metadata.client_name.trim().slice(0, 80)
+        : "cliente sem nome";
+
+    this.clients.add({
+      clientId,
+      secretDigest: secret ? hex(secret) : null,
+      redirectUris,
+      name,
+      createdAt: Date.now(),
+    });
+    this.log(`/register: "${name}" registrado (${isPublic ? "público" : "confidencial"})`);
+
+    return json(
+      {
+        client_id: clientId,
+        ...(secret ? { client_secret: secret } : {}),
+        client_id_issued_at: Math.floor(Date.now() / 1000),
+        // 0 = não expira. Rotacionar exigiria um endpoint de gestão que este
+        // servidor não tem.
+        ...(secret ? { client_secret_expires_at: 0 } : {}),
+        redirect_uris: redirectUris,
+        client_name: name,
+        token_endpoint_auth_method: isPublic ? "none" : "client_secret_post",
+        grant_types: ["authorization_code", "refresh_token"],
+        response_types: ["code"],
+      },
+      201,
+    );
+  }
+
+  /** Valida o pedido do Claude e manda a pessoa para o Google. */
+  private authorize(url: URL): Response {
+    const params = url.searchParams;
+    const clientId = params.get("client_id") ?? "";
+    const redirectUri = params.get("redirect_uri") ?? "";
+
+    // client_id e redirect_uri inválidos nunca podem virar redirect: seria um
     // open redirect e entregaria o código a quem escolheu a URL.
-    if (clientId !== this.config.clientId) {
-      this.log(`/authorize recusado: client_id desconhecido "${clientId}"`);
+    const client = clientId ? this.clients.find(clientId) : undefined;
+    if (!client) {
+      this.log(`/authorize recusado: client_id desconhecido`);
       return errorPage(
-        "Client ID não confere",
-        "Confira o campo OAuth Client ID nas configurações avançadas do conector.",
+        "Conector não reconhecido",
+        "Remova o conector e adicione de novo — o registro dele não existe " +
+          "mais neste servidor.",
       );
     }
-    if (!this.allowsRedirect(redirectUri)) {
-      this.log(`/authorize recusado: redirect_uri não permitido "${redirectUri}"`);
+    if (!client.redirectUris.includes(redirectUri)) {
+      this.log(`/authorize recusado: redirect_uri fora do registro "${redirectUri}"`);
       return errorPage(
         "Callback não permitido",
-        `A URL ${redirectUri || "(vazia)"} não está na allowlist. ` +
-          "Adicione-a em MCP_OAUTH_REDIRECT_URIS se for legítima.",
+        "A URL de retorno não é uma das que este conector registrou.",
       );
     }
 
     const challenge = params.get("code_challenge") ?? "";
-    const method = params.get("code_challenge_method") ?? "";
-    if (!challenge || method !== "S256") {
-      return redirectError(redirectUri, params.get("state"), "invalid_request", "PKCE S256 obrigatório.");
+    const state = params.get("state");
+    if (!challenge || params.get("code_challenge_method") !== "S256") {
+      return redirectError(redirectUri, state, "invalid_request", "PKCE S256 obrigatório.");
     }
     if (params.get("response_type") !== "code") {
-      return redirectError(redirectUri, params.get("state"), "unsupported_response_type", "Só response_type=code.");
+      return redirectError(redirectUri, state, "unsupported_response_type", "Só response_type=code.");
     }
 
-    return loginPage({
+    // Dois `state` no mesmo fluxo: este é o nosso, para o Google; o do Claude
+    // fica guardado aqui dentro e volta no redirect final.
+    const googleState = randomToken();
+    this.pending.set(googleState, {
+      clientId,
       redirectUri,
-      state: params.get("state") ?? "",
+      clientState: state ?? "",
       challenge,
-      error: null,
+      expiresAt: Date.now() + PENDING_TTL_MS,
+    });
+    this.sweepPending();
+
+    return new Response(null, {
+      status: 302,
+      headers: { location: googleAuthorizationUrl(this.google, googleState) },
     });
   }
 
-  /** Valida o token pessoal e devolve o código de autorização. */
-  private async authorizeSubmit(request: Request): Promise<Response> {
-    const form = new URLSearchParams(await request.text());
-    const redirectUri = form.get("redirect_uri") ?? "";
-    const state = form.get("state") ?? "";
-    const challenge = form.get("challenge") ?? "";
-    const secret = form.get("token")?.trim() ?? "";
+  /** Volta do Google: valida a identidade e emite o código para o Claude. */
+  private async googleCallback(url: URL): Promise<Response> {
+    const params = url.searchParams;
 
-    // Revalida em vez de confiar no hidden field: o POST chega do navegador e
-    // pode ter sido montado à mão.
-    if (!this.allowsRedirect(redirectUri) || !challenge) {
-      return errorPage("Requisição inválida", "Reinicie a conexão pelo Claude.");
+    if (params.get("error")) {
+      return errorPage("Login cancelado", `O Google respondeu: ${params.get("error")}`);
     }
 
-    const owner = secret ? this.matchStatic(secret) : undefined;
-    if (!owner) {
-      this.log(`/authorize: token pessoal inválido`);
-      return loginPage({
-        redirectUri,
-        state,
-        challenge,
-        error: "Token não reconhecido. Confira se copiou a linha inteira.",
-      });
+    const state = params.get("state") ?? "";
+    const pending = state ? this.pending.get(state) : undefined;
+    // Uso único: consumir antes de validar impede replay do mesmo callback.
+    if (state) this.pending.delete(state);
+
+    if (!pending || pending.expiresAt <= Date.now()) {
+      return errorPage(
+        "Sessão de login expirada",
+        "Tente conectar de novo pelo Claude — o pedido demorou mais que o " +
+          "permitido ou já foi usado.",
+      );
     }
 
-    const code = randomToken();
-    this.codes.set(hex(code), {
-      staticDigest: owner.digest.toString("hex"),
-      name: owner.name,
-      redirectUri,
-      challenge,
+    const code = params.get("code") ?? "";
+    if (!code) return errorPage("Login incompleto", "O Google não devolveu um código.");
+
+    let identity;
+    try {
+      identity = await exchangeGoogleCode(this.google, code);
+    } catch (err) {
+      const detail = err instanceof GoogleLoginError ? err.message : "Falha inesperada.";
+      this.log(`/oauth/google/callback: login recusado — ${detail}`);
+      return errorPage("Não foi possível entrar", detail);
+    }
+
+    const user = this.findUser(identity.email);
+    if (!user) {
+      this.log(`/oauth/google/callback: ${identity.email} fora da allowlist`);
+      return errorPage(
+        "Conta sem acesso",
+        `${identity.email} não está na lista de quem pode usar este servidor. ` +
+          "Peça para ser incluído e tente de novo.",
+      );
+    }
+
+    const authCode = randomToken();
+    this.codes.set(hex(authCode), {
+      email: user.email,
+      clientId: pending.clientId,
+      redirectUri: pending.redirectUri,
+      challenge: pending.challenge,
       expiresAt: Date.now() + CODE_TTL_MS,
     });
-    this.log(`/authorize: código emitido para ${owner.name}`);
+    this.log(`/authorize: código emitido para ${user.email}`);
 
-    const target = new URL(redirectUri);
-    target.searchParams.set("code", code);
-    if (state) target.searchParams.set("state", state);
+    const target = new URL(pending.redirectUri);
+    target.searchParams.set("code", authCode);
+    if (pending.clientState) target.searchParams.set("state", pending.clientState);
     return new Response(null, { status: 302, headers: { location: target.toString() } });
   }
 
   private async token(request: Request): Promise<Response> {
     const form = new URLSearchParams(await request.text());
 
-    if (!this.authenticateClient(request, form)) {
+    const client = this.authenticateClient(request, form);
+    if (!client) {
       return oauthError("invalid_client", "client_id ou client_secret incorretos.", 401);
     }
 
     const grant = form.get("grant_type");
-    if (grant === "authorization_code") return this.exchangeCode(form);
-    if (grant === "refresh_token") return this.refresh(form);
+    if (grant === "authorization_code") return this.exchangeCode(form, client);
+    if (grant === "refresh_token") return this.refresh(form, client);
     return oauthError("unsupported_grant_type", `grant_type "${grant}" não suportado.`);
   }
 
-  private authenticateClient(request: Request, form: URLSearchParams): boolean {
+  private authenticateClient(
+    request: Request,
+    form: URLSearchParams,
+  ): RegisteredClient | undefined {
     let id = form.get("client_id") ?? "";
     let secret = form.get("client_secret") ?? "";
 
@@ -414,25 +548,36 @@ export class AuthorizationServer {
       }
     }
 
-    return (
-      Boolean(id) &&
-      Boolean(secret) &&
-      secretEquals(id, this.config.clientId) &&
-      secretEquals(secret, this.config.clientSecret)
-    );
+    const client = id ? this.clients.find(id) : undefined;
+    if (!client) return undefined;
+
+    // Cliente público: sem segredo para conferir, quem protege o código é o
+    // PKCE. Cliente confidencial: o segredo é obrigatório, sempre.
+    if (client.secretDigest === null) return client;
+    if (!secret) return undefined;
+    return timingSafeEqual(sha256(secret), Buffer.from(client.secretDigest, "hex"))
+      ? client
+      : undefined;
   }
 
-  private exchangeCode(form: URLSearchParams): Response {
+  private exchangeCode(form: URLSearchParams, client: RegisteredClient): Response {
     const code = form.get("code") ?? "";
     const key = hex(code);
     const pending = this.codes.get(key);
 
-    // Uso único: consumir antes de validar impede que uma corrida troque o
-    // mesmo código duas vezes.
+    // Uso único, e consumido *antes* de validar: uma corrida não troca o mesmo
+    // código duas vezes, e uma tentativa malsucedida queima o código em vez de
+    // deixá-lo disponível para a próxima. Um código que alguém já tentou usar
+    // indevidamente não deve continuar valendo.
     this.codes.delete(key);
 
     if (!pending || pending.expiresAt <= Date.now()) {
       return oauthError("invalid_grant", "Código inválido ou expirado.");
+    }
+    // Sem isto, um cliente registrado poderia trocar o código emitido para
+    // outro.
+    if (pending.clientId !== client.clientId) {
+      return oauthError("invalid_grant", "Código emitido para outro cliente.");
     }
     if (form.get("redirect_uri") !== pending.redirectUri) {
       return oauthError("invalid_grant", "redirect_uri diferente do usado no /authorize.");
@@ -443,45 +588,56 @@ export class AuthorizationServer {
       return oauthError("invalid_grant", "code_verifier não confere.");
     }
 
-    const owner = this.findStatic(pending.staticDigest);
-    if (!owner) return oauthError("invalid_grant", "Acesso revogado.");
+    const user = this.findUser(pending.email);
+    if (!user) return oauthError("invalid_grant", "Acesso revogado.");
 
-    const { access, refresh } = this.store.create(owner.name, pending.staticDigest);
-    this.log(`/token: sessão criada para ${owner.name}`);
-    return tokenResponse(access, refresh, owner.scopes);
+    const { access, refresh } = this.sessions.create(user.email, client.clientId);
+    this.log(`/token: sessão criada para ${user.email}`);
+    return tokenResponse(access, refresh, user.scopes);
   }
 
-  private refresh(form: URLSearchParams): Response {
+  private refresh(form: URLSearchParams, client: RegisteredClient): Response {
     const token = form.get("refresh_token") ?? "";
-    const session = token ? this.store.findByRefresh(token) : undefined;
-    if (!session) return oauthError("invalid_grant", "Refresh token inválido.");
+    const session = token ? this.sessions.findByRefresh(token) : undefined;
+    if (!session || session.clientId !== client.clientId) {
+      return oauthError("invalid_grant", "Refresh token inválido.");
+    }
 
-    // A checagem que faz a revogação valer: sumiu do MCP_HTTP_TOKENS, o
-    // refresh para de funcionar no próximo ciclo de uma hora.
-    const owner = this.findStatic(session.staticDigest);
-    if (!owner) {
-      this.log(`/token: refresh negado, acesso revogado (${session.name})`);
+    // A checagem que faz a revogação valer: saiu da allowlist, o refresh para
+    // de funcionar no próximo ciclo de uma hora.
+    const user = this.findUser(session.email);
+    if (!user) {
+      this.log(`/token: refresh negado, acesso revogado (${session.email})`);
       return oauthError("invalid_grant", "Acesso revogado.");
     }
 
-    const access = this.store.renew(session);
-    return tokenResponse(access, token, owner.scopes);
+    const access = this.sessions.renew(session);
+    return tokenResponse(access, token, user.scopes);
   }
 
-  private allowsRedirect(uri: string): boolean {
-    if (this.config.redirectUris.includes(uri)) return true;
-
-    // Loopback com porta variável: o Claude Desktop sobe um servidor efêmero e
-    // a porta muda a cada execução, então casar exato é inviável.
-    try {
-      const parsed = new URL(uri);
-      return (
-        parsed.protocol === "http:" &&
-        (parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost")
-      );
-    } catch {
-      return false;
+  /** Limpa pedidos abandonados — quem abriu o login e fechou a aba. */
+  private sweepPending(): void {
+    const now = Date.now();
+    for (const [key, value] of this.pending) {
+      if (value.expiresAt <= now) this.pending.delete(key);
     }
+  }
+}
+
+/**
+ * https, ou loopback em qualquer porta: o Claude Desktop sobe um servidor
+ * efêmero e a porta muda a cada execução, então casar exato é inviável.
+ */
+function isUsableRedirect(uri: string): boolean {
+  try {
+    const parsed = new URL(uri);
+    if (parsed.protocol === "https:") return true;
+    return (
+      parsed.protocol === "http:" &&
+      (parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost")
+    );
+  } catch {
+    return false;
   }
 }
 
@@ -553,52 +709,11 @@ function escapeHtml(value: string): string {
   );
 }
 
-/** Página única, sem asset externo: é servida antes de qualquer autenticação. */
-function loginPage(opts: {
-  redirectUri: string;
-  state: string;
-  challenge: string;
-  error: string | null;
-}): Response {
-  const html = `<!doctype html>
-<html lang="pt-BR">
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Conectar ao Meta Business Insights</title>
-<style>
-  :root { color-scheme: light dark; }
-  body { font: 16px/1.5 system-ui, sans-serif; margin: 0; display: grid; place-items: center; min-height: 100vh; padding: 1.5rem; }
-  main { width: min(26rem, 100%); }
-  h1 { font-size: 1.25rem; margin: 0 0 .5rem; }
-  p { margin: 0 0 1.25rem; opacity: .75; }
-  label { display: block; font-weight: 600; margin-bottom: .375rem; }
-  input { width: 100%; box-sizing: border-box; padding: .625rem .75rem; font: inherit; font-family: ui-monospace, monospace; border: 1px solid color-mix(in srgb, currentColor 30%, transparent); border-radius: .5rem; background: transparent; color: inherit; }
-  button { width: 100%; margin-top: 1rem; padding: .625rem; font: inherit; font-weight: 600; border: 0; border-radius: .5rem; background: #2563eb; color: #fff; cursor: pointer; }
-  .erro { padding: .75rem; border-radius: .5rem; background: color-mix(in srgb, #dc2626 15%, transparent); margin-bottom: 1rem; }
-</style>
-<main>
-  <h1>Conectar ao Meta Business Insights</h1>
-  <p>Cole o token pessoal que você recebeu. Ele fica só neste servidor — o Claude guarda uma sessão, não o token.</p>
-  ${opts.error ? `<div class="erro">${escapeHtml(opts.error)}</div>` : ""}
-  <form method="post" action="/authorize">
-    <input type="hidden" name="redirect_uri" value="${escapeHtml(opts.redirectUri)}">
-    <input type="hidden" name="state" value="${escapeHtml(opts.state)}">
-    <input type="hidden" name="challenge" value="${escapeHtml(opts.challenge)}">
-    <label for="token">Token pessoal</label>
-    <input id="token" name="token" type="password" autocomplete="off" autocapitalize="off"
-           autocorrect="off" spellcheck="false" required autofocus>
-    <button type="submit">Autorizar</button>
-  </form>
-</main>
-</html>`;
-
-  return new Response(html, {
-    // 200 mesmo no caso de erro de token: é a mesma tela, repetida.
-    status: 200,
-    headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
-  });
-}
-
+/**
+ * Única página que este servidor renderiza. O caminho feliz é só redirect —
+ * a pessoa vê a tela do Google, não uma nossa. Sem asset externo: é servida
+ * antes de qualquer autenticação.
+ */
 function errorPage(title: string, detail: string): Response {
   const html = `<!doctype html>
 <html lang="pt-BR">
