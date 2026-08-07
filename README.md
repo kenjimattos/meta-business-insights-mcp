@@ -108,22 +108,36 @@ O ganho não é performance: é que o token do Meta fica só na VPS. Distribuir 
 `.env` para cada pessoa colocaria um token com acesso de escrita ao portfólio
 inteiro em N notebooks, sem forma de revogar um sem revogar todos.
 
-### 1. Tokens da equipe
+### 1. Quem pode entrar
 
-Um bearer por pessoa, não um compartilhado. Custa o mesmo e permite tirar
-alguém removendo uma linha:
+Uma lista de e-mails, não uma lista de segredos. Quem entra faz login com a
+conta do Google Workspace que já tem, e tirar alguém é remover a entrada:
+
+```
+MCP_ALLOWED_EMAILS=ana@empresa.com:write,bruno@empresa.com,carla@empresa.com
+```
+
+O sufixo `:write` é o que separa quem consulta de quem publica em nome das
+marcas. O e-mail aparece no log de cada request, então o journal diz quem
+consultou.
+
+Estar no domínio do Workspace não basta de propósito: o `GOOGLE_HD` (passo 5)
+diz que a pessoa é da empresa, e esta lista diz que ela é do time que olha o
+portfólio.
+
+Opcionalmente, um ou dois bearers estáticos como saída de emergência — para o
+`curl` de diagnóstico e para a ponte local, se alguém precisar dela:
 
 ```bash
-openssl rand -hex 32   # repita por pessoa
+openssl rand -hex 32
 ```
 
 ```
-MCP_HTTP_TOKENS=ana:3f9c…,bruno:a71d…,carla:88e2…
+MCP_HTTP_TOKENS=emergencia:3f9c…
 ```
 
-O nome antes do `:` só serve para o log — cada linha do journal diz quem
-consultou. O servidor se recusa a subir com `MCP_HTTP_TOKENS` vazio, para que
-ninguém exponha o portfólio por esquecimento.
+O servidor se recusa a subir com as duas listas vazias, para que ninguém exponha
+o portfólio por esquecimento.
 
 ### 2. Na VPS
 
@@ -154,8 +168,8 @@ O `.env` **não** vai para a VPS. As variáveis ficam em `/etc/meta-mcp.env`
 ```bash
 install -m 600 /dev/null /etc/meta-mcp.env
 $EDITOR /etc/meta-mcp.env     # META_ACCESS_TOKEN, META_BUSINESS_ID,
-                              # MCP_HTTP_TOKENS, META_DATA_DIR=/var/lib/meta-mcp,
-                              # MCP_OAUTH_* (veja o passo 5)
+                              # MCP_ALLOWED_EMAILS, META_DATA_DIR=/var/lib/meta-mcp,
+                              # MCP_OAUTH_ISSUER e GOOGLE_* (veja o passo 5)
 cp deploy/meta-mcp.service /etc/systemd/system/
 systemctl daemon-reload && systemctl enable --now meta-mcp
 journalctl -u meta-mcp -f
@@ -216,78 +230,83 @@ curl -X POST https://mcp.exemplo.com/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
-### 5. Ligar o OAuth
+### 5. Login pelo Google
 
-A interface de conectores do Claude não tem campo para um bearer fixo — só para
-credenciais de OAuth. Por isso o servidor traz um authorization server próprio,
-em [src/oauth.ts](src/oauth.ts). Ele **não** fala com o Meta e não cria login
-novo: o `META_ACCESS_TOKEN` continua sendo um só, aqui na VPS, e os bearers de
-`MCP_HTTP_TOKENS` continuam sendo a credencial de cada pessoa. A diferença é
-que ela digita o dela uma vez numa página deste servidor, em vez de colar num
-arquivo de configuração local.
+A janela "Add custom connector" do Claude não tem campo para bearer fixo — só
+para credenciais de OAuth. Por isso o servidor traz um authorization server
+próprio, em [src/oauth.ts](src/oauth.ts), com o Google como identidade.
 
-É isso que destrava o celular: a ponte `mcp-remote` (opção alternativa, abaixo)
-roda na máquina de quem usa, e no telefone não há máquina. Um conector remoto
-com OAuth vive na conta, então aparece no Desktop, no claude.ai e no app ao
-mesmo tempo.
+Ele **não** fala com a Graph API e não decide o que a pessoa alcança no Meta: o
+`META_ACCESS_TOKEN` continua sendo um só, aqui na VPS. O Google entra uma vez,
+no login, só para dizer quem é a pessoa; a `MCP_ALLOWED_EMAILS` diz se ela
+entra. Nenhum segredo é distribuído para ninguém.
 
-Gere o par do cliente e acrescente em `/etc/meta-mcp.env`:
+É isso que destrava o celular: a ponte `mcp-remote` (alternativa, no fim desta
+seção) roda na máquina de quem usa, e no telefone não há máquina. Um conector
+remoto vive na conta, então aparece no Desktop, no claude.ai e no app ao mesmo
+tempo.
 
-```bash
-openssl rand -hex 16   # MCP_OAUTH_CLIENT_ID
-openssl rand -hex 32   # MCP_OAUTH_CLIENT_SECRET
+No **Google Cloud Console**, uma vez: crie um projeto → OAuth consent screen
+**Internal** (com Workspace não há processo de verificação) → Credentials →
+Create OAuth client ID → tipo **Web application**. Em Authorized redirect URIs,
+exatamente:
+
 ```
+https://mcp.exemplo.com/oauth/google/callback
+```
+
+Copie o client ID e o secret para `/etc/meta-mcp.env`:
 
 ```
 MCP_OAUTH_ISSUER=https://mcp.exemplo.com
-MCP_OAUTH_CLIENT_ID=…
-MCP_OAUTH_CLIENT_SECRET=…
+GOOGLE_CLIENT_ID=….apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=…
+GOOGLE_HD=empresa.com
 ```
 
-Esse par identifica o **Claude**, não a pessoa: é o mesmo para a equipe inteira
-e vai junto com a URL nas instruções. Quem separa uma pessoa da outra continua
-sendo o token de `MCP_HTTP_TOKENS`.
+O `GOOGLE_HD` restringe ao domínio do Workspace. Vale saber que o parâmetro
+`hd` que vai na URL do Google é só conveniência — ele filtra o seletor de
+contas. Quem realmente barra é a verificação da claim `hd` no `id_token`, feita
+no servidor, mais a allowlist.
 
-Não há Dynamic Client Registration de propósito — os campos avançados de "Add
-custom connector" aceitam client id e secret fixos, o que dispensa um endpoint
-a mais de superfície. O efeito colateral é que deixar os dois campos em branco
-faz a conexão falhar com um erro pouco descritivo: mande-os junto com a URL.
-
-O `deploy/Caddyfile` não muda. O `reverse_proxy` sem matcher já encaminha
-`/authorize`, `/token` e `/.well-known/*` junto com o `/mcp`.
+O `deploy/Caddyfile` não muda: o `reverse_proxy` sem matcher já encaminha
+`/authorize`, `/token`, `/register`, `/oauth/google/callback` e
+`/.well-known/*` junto com o `/mcp`.
 
 ### 6. Cada pessoa adiciona o conector
 
-Em Configurações → Conectores → "Add custom connector", quatro campos:
+Em Configurações → Conectores → "Add custom connector", **dois campos**:
 
 | Campo | Valor |
 | --- | --- |
 | Name | Meta Business Insights |
 | Remote MCP server URL | `https://mcp.exemplo.com/mcp` |
-| OAuth Client ID | o `MCP_OAUTH_CLIENT_ID` |
-| OAuth Client Secret | o `MCP_OAUTH_CLIENT_SECRET` |
 
-Ao clicar em Connect, o Claude abre a tela do servidor; a pessoa cola ali o
-token pessoal dela e pronto. Nada de Node, `npx` ou
-`claude_desktop_config.json` na máquina de ninguém — e some o problema de
-escape de espaço no Windows que a ponte tinha.
+Client ID e Secret ficam **em branco** — o Claude se registra sozinho
+(Dynamic Client Registration, RFC 7591). Ao clicar em Connect, ele abre a tela
+do Google; a pessoa escolhe a conta de trabalho e volta conectada.
 
-**Revogar continua sendo apagar uma linha.** Cada sessão fica amarrada ao
-*digest* do token estático que a originou, não ao nome. Tirar alguém de
-`MCP_HTTP_TOKENS` e reiniciar mata o access token, o refresh token e a linha em
-`oauth-sessions.json` — trocar o token de alguém tem o mesmo efeito. Adicionar
-`:write` a alguém também passa a valer no próximo restart, sem relogin, porque
-os scopes são relidos da lista viva a cada request.
+Nada de Node, `npx` ou `claude_desktop_config.json` na máquina de ninguém, e
+nenhum token circulando por chat. No celular é idêntico.
 
-O `oauth-sessions.json`, em `META_DATA_DIR`, guarda só digests: o backup dele
-não devolve nenhum token utilizável.
+**Revogar é apagar uma linha.** As sessões são ancoradas no e-mail: tirar
+alguém de `MCP_ALLOWED_EMAILS` e reiniciar mata o access token, o refresh token
+e o registro em `oauth-sessions.json`, de uma vez. Conceder `:write` também
+passa a valer no restart seguinte, sem relogin, porque os scopes são relidos da
+lista viva a cada request.
+
+Em `META_DATA_DIR` ficam dois arquivos: `oauth-sessions.json`, que guarda só
+digests — o backup dele não devolve nenhum token utilizável — e
+`oauth-clients.json`, com os clientes registrados. Este último precisa
+persistir: o Claude registra uma vez e guarda o `client_id` na conta, então
+perdê-lo obrigaria todo mundo a readicionar o conector.
 
 ### Alternativa: ponte local stdio→HTTP
 
-Continua funcionando, e o bearer estático segue aceito direto no `/mcp` — é o
-que o `curl` de diagnóstico usa. Serve para quem não quer OAuth, ao custo de
-não ter acesso pelo celular nem pelo claude.ai. Cada pessoa põe no próprio
-`claude_desktop_config.json`:
+Continua funcionando, e o bearer estático de `MCP_HTTP_TOKENS` segue aceito
+direto no `/mcp` — é o que o `curl` de diagnóstico usa. Serve para quem não
+puder usar o login Google, ao custo de não ter acesso pelo celular nem pelo
+claude.ai. Cada pessoa põe no próprio `claude_desktop_config.json`:
 
 ```json
 {
@@ -312,25 +331,24 @@ O `Authorization:${AUTH_HEADER}` sem espaço depois do `:` é intencional: o
 Claude Desktop no Windows não escapa espaços dentro de `args` ao chamar o
 `npx`, e o header chega quebrado. O espaço vai dentro da variável.
 
-### O que o OAuth daqui não resolve
+### O que o login Google não resolve
 
-Vale ter explícito, porque é fácil descobrir tarde. O authorization server
-resolve o acesso pelo celular e tira o Node da máquina de cada pessoa — mas o
-modelo de permissão continua o de antes, porque quem fala com o Meta continua
-sendo um token único:
+Vale ter explícito, porque é fácil descobrir tarde. O Google resolve *quem é a
+pessoa* — não resolve *o que ela alcança no Meta*, porque quem fala com a Graph
+API continua sendo um token único:
 
-- **Sem consentimento por pessoa.** Quem tem o token tem tudo que as 9 tools
-  fazem, incluindo `graph_api_get`. Um login que respeitasse o cargo de cada um
-  no Business Manager exigiria delegar ao Facebook Login — e aí entram App
-  Review, expiração de token e particionar o cache de snapshots por identidade,
-  que hoje é um arquivo só.
-- **Revogação é manual.** Sai alguém → editar `/etc/meta-mcp.env` e
-  `systemctl restart meta-mcp`. O restart é o que derruba as sessões OAuth
-  daquela pessoa.
+- **Sem consentimento por pessoa.** Quem entra tem tudo que as 9 tools fazem,
+  incluindo `graph_api_get`. Um acesso que respeitasse o cargo de cada um no
+  Business Manager exigiria delegar ao Facebook Login em vez do Google — e aí
+  entram App Review, expiração de token de usuário e particionar o cache de
+  snapshots por identidade, que hoje é um arquivo só.
+- **Revogação exige restart.** Sai alguém → editar `/etc/meta-mcp.env` e
+  `systemctl restart meta-mcp`. Desativar a conta no Workspace impede logins
+  novos, mas a sessão já emitida vive até o restart ou até o access token
+  vencer, em no máximo uma hora.
 - **O token do Meta não expira sozinho.** Vale trocar periodicamente.
-- **Nunca coloque o token na URL** (`?token=…`). A especificação do MCP proíbe,
-  e URLs vazam em log de proxy, histórico e referrer. É por isso que aqui ele
-  vai no header.
+- **Nunca coloque credencial na URL** (`?token=…`). A especificação do MCP
+  proíbe, e URLs vazam em log de proxy, histórico e referrer.
 
 ## Tools
 
