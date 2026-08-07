@@ -16,13 +16,17 @@ import { createServer as createNodeServer, type IncomingMessage, type ServerResp
 import {
   bearerAuthChallengeResponse,
   createMcpHandler,
+  getOAuthProtectedResourceMetadataUrl,
+  oauthMetadataResponse,
   verifyBearerToken,
+  type AuthInfo,
 } from "@modelcontextprotocol/server";
 
 import { loadConfig } from "./config.js";
 import { createServer } from "./server.js";
 import { createStaticTokenVerifier, parseTokens } from "./auth.js";
 import { toWebRequest, writeNodeResponse } from "./http-bridge.js";
+import { AuthorizationServer, loadOAuthConfig } from "./oauth.js";
 
 const port = Number(process.env.MCP_HTTP_PORT ?? 8787);
 const host = process.env.MCP_HTTP_HOST?.trim() || "127.0.0.1";
@@ -30,9 +34,42 @@ const mcpPath = process.env.MCP_HTTP_PATH?.trim() || "/mcp";
 
 // Falha ao subir, e não na primeira requisição: um servidor sem token exposto
 // por engano entrega o portfólio inteiro para quem descobrir a URL.
-const verifier = createStaticTokenVerifier(parseTokens(process.env.MCP_HTTP_TOKENS));
+const tokens = parseTokens(process.env.MCP_HTTP_TOKENS);
+const staticVerifier = createStaticTokenVerifier(tokens);
 
-const { allowWrites } = loadConfig();
+const { allowWrites, dataDir } = loadConfig();
+
+// OAuth é opcional: sem MCP_OAUTH_ISSUER o servidor segue só com bearer
+// estático, do jeito que a ponte local espera.
+const oauthConfig = loadOAuthConfig(dataDir);
+const oauth = oauthConfig ? new AuthorizationServer(oauthConfig, tokens, log) : undefined;
+
+const authMetadata = oauthConfig
+  ? {
+      oauthMetadata: oauth!.metadata(),
+      resourceServerUrl: new URL(`${oauthConfig.issuer}${mcpPath}`),
+      resourceName: "Meta Business Insights",
+      scopesSupported: ["write"],
+    }
+  : undefined;
+
+const resourceMetadataUrl = authMetadata
+  ? getOAuthProtectedResourceMetadataUrl(authMetadata.resourceServerUrl)
+  : undefined;
+
+/**
+ * Aceita as duas credenciais. A sessão OAuth é o caminho novo; o bearer
+ * estático cru continua valendo para a ponte `mcp-remote` e para o `curl` de
+ * diagnóstico. Tenta o estático primeiro por ser o mais barato.
+ */
+async function verifyAccessToken(token: string): Promise<AuthInfo> {
+  try {
+    return await staticVerifier.verifyAccessToken(token);
+  } catch (err) {
+    if (!oauth) throw err;
+    return await oauth.verifyAccessToken(token);
+  }
+}
 
 // Duas trancas em série para escrita: a instância precisa permitir (variável de
 // ambiente) *e* o bearer daquela pessoa precisa ter o sufixo `:write`. Quem não
@@ -63,6 +100,27 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
 
+  // As rotas do OAuth vêm antes da checagem de bearer: são justamente as que
+  // uma pessoa ainda sem sessão precisa alcançar. O teste de caminho evita
+  // consumir o corpo da requisição do `/mcp` — `toWebRequest` esgota o stream,
+  // e ele só pode ser lido uma vez.
+  if (oauth && authMetadata && isOAuthPath(url.pathname)) {
+    const request = await toWebRequest(req);
+
+    const discovery = oauthMetadataResponse(request, authMetadata);
+    if (discovery) {
+      await writeNodeResponse(res, discovery);
+      return;
+    }
+
+    const handled = await oauth.handle(request, url);
+    if (handled) {
+      log(`${handled.status} ${req.method} ${url.pathname} de ${clientIp(req)}`);
+      await writeNodeResponse(res, handled);
+      return;
+    }
+  }
+
   if (url.pathname !== mcpPath) {
     res.writeHead(404, { "content-type": "text/plain" });
     res.end("Not Found");
@@ -71,10 +129,14 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 
   let authInfo;
   try {
-    authInfo = await verifyBearerToken(req.headers.authorization, { verifier });
+    authInfo = await verifyBearerToken(req.headers.authorization, {
+      verifier: { verifyAccessToken },
+      // Sem isto o Claude recebe um 401 mudo e não descobre onde autenticar.
+      resourceMetadataUrl,
+    });
   } catch (err) {
     log(`401 ${req.method} ${url.pathname} de ${clientIp(req)}`);
-    await writeNodeResponse(res, bearerAuthChallengeResponse(err));
+    await writeNodeResponse(res, bearerAuthChallengeResponse(err, { resourceMetadataUrl }));
     return;
   }
 
@@ -86,6 +148,14 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   const request = await toWebRequest(req);
   const response = await handler.fetch(request, { authInfo });
   await writeNodeResponse(res, response);
+}
+
+function isOAuthPath(pathname: string): boolean {
+  return (
+    pathname === "/authorize" ||
+    pathname === "/token" ||
+    pathname.startsWith("/.well-known/")
+  );
 }
 
 function clientIp(req: IncomingMessage): string {

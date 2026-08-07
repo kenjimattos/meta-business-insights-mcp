@@ -154,7 +154,8 @@ O `.env` **não** vai para a VPS. As variáveis ficam em `/etc/meta-mcp.env`
 ```bash
 install -m 600 /dev/null /etc/meta-mcp.env
 $EDITOR /etc/meta-mcp.env     # META_ACCESS_TOKEN, META_BUSINESS_ID,
-                              # MCP_HTTP_TOKENS, META_DATA_DIR=/var/lib/meta-mcp
+                              # MCP_HTTP_TOKENS, META_DATA_DIR=/var/lib/meta-mcp,
+                              # MCP_OAUTH_* (veja o passo 5)
 cp deploy/meta-mcp.service /etc/systemd/system/
 systemctl daemon-reload && systemctl enable --now meta-mcp
 journalctl -u meta-mcp -f
@@ -215,19 +216,78 @@ curl -X POST https://mcp.exemplo.com/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
-### 5. Conectar o Claude Desktop de cada pessoa
+### 5. Ligar o OAuth
 
-Duas formas, porque a interface de conectores do Claude só tem campos de OAuth
-— não há campo para um bearer fixo.
+A interface de conectores do Claude não tem campo para um bearer fixo — só para
+credenciais de OAuth. Por isso o servidor traz um authorization server próprio,
+em [src/oauth.ts](src/oauth.ts). Ele **não** fala com o Meta e não cria login
+novo: o `META_ACCESS_TOKEN` continua sendo um só, aqui na VPS, e os bearers de
+`MCP_HTTP_TOKENS` continuam sendo a credencial de cada pessoa. A diferença é
+que ela digita o dela uma vez numa página deste servidor, em vez de colar num
+arquivo de configuração local.
 
-**a) Conector personalizado com `static_headers`.** É o caminho limpo: o Owner
-da organização adiciona o conector uma vez em Configurações da organização, com
-o header, e cada pessoa só habilita. Só que `static_headers` está em **beta** e
-o credencial é único para a organização inteira — o que anula os tokens por
-pessoa. Confira se sua conta tem a opção antes de contar com ela.
+É isso que destrava o celular: a ponte `mcp-remote` (opção alternativa, abaixo)
+roda na máquina de quem usa, e no telefone não há máquina. Um conector remoto
+com OAuth vive na conta, então aparece no Desktop, no claude.ai e no app ao
+mesmo tempo.
 
-**b) Ponte local stdio→HTTP.** Funciona hoje, em qualquer plano, e preserva um
-token por pessoa. Cada uma põe no próprio `claude_desktop_config.json`:
+Gere o par do cliente e acrescente em `/etc/meta-mcp.env`:
+
+```bash
+openssl rand -hex 16   # MCP_OAUTH_CLIENT_ID
+openssl rand -hex 32   # MCP_OAUTH_CLIENT_SECRET
+```
+
+```
+MCP_OAUTH_ISSUER=https://mcp.exemplo.com
+MCP_OAUTH_CLIENT_ID=…
+MCP_OAUTH_CLIENT_SECRET=…
+```
+
+Esse par identifica o **Claude**, não a pessoa: é o mesmo para a equipe inteira
+e vai junto com a URL nas instruções. Quem separa uma pessoa da outra continua
+sendo o token de `MCP_HTTP_TOKENS`.
+
+Não há Dynamic Client Registration de propósito — os campos avançados de "Add
+custom connector" aceitam client id e secret fixos, o que dispensa um endpoint
+a mais de superfície. O efeito colateral é que deixar os dois campos em branco
+faz a conexão falhar com um erro pouco descritivo: mande-os junto com a URL.
+
+O `deploy/Caddyfile` não muda. O `reverse_proxy` sem matcher já encaminha
+`/authorize`, `/token` e `/.well-known/*` junto com o `/mcp`.
+
+### 6. Cada pessoa adiciona o conector
+
+Em Configurações → Conectores → "Add custom connector", quatro campos:
+
+| Campo | Valor |
+| --- | --- |
+| Name | Meta Business Insights |
+| Remote MCP server URL | `https://mcp.exemplo.com/mcp` |
+| OAuth Client ID | o `MCP_OAUTH_CLIENT_ID` |
+| OAuth Client Secret | o `MCP_OAUTH_CLIENT_SECRET` |
+
+Ao clicar em Connect, o Claude abre a tela do servidor; a pessoa cola ali o
+token pessoal dela e pronto. Nada de Node, `npx` ou
+`claude_desktop_config.json` na máquina de ninguém — e some o problema de
+escape de espaço no Windows que a ponte tinha.
+
+**Revogar continua sendo apagar uma linha.** Cada sessão fica amarrada ao
+*digest* do token estático que a originou, não ao nome. Tirar alguém de
+`MCP_HTTP_TOKENS` e reiniciar mata o access token, o refresh token e a linha em
+`oauth-sessions.json` — trocar o token de alguém tem o mesmo efeito. Adicionar
+`:write` a alguém também passa a valer no próximo restart, sem relogin, porque
+os scopes são relidos da lista viva a cada request.
+
+O `oauth-sessions.json`, em `META_DATA_DIR`, guarda só digests: o backup dele
+não devolve nenhum token utilizável.
+
+### Alternativa: ponte local stdio→HTTP
+
+Continua funcionando, e o bearer estático segue aceito direto no `/mcp` — é o
+que o `curl` de diagnóstico usa. Serve para quem não quer OAuth, ao custo de
+não ter acesso pelo celular nem pelo claude.ai. Cada pessoa põe no próprio
+`claude_desktop_config.json`:
 
 ```json
 {
@@ -252,19 +312,22 @@ O `Authorization:${AUTH_HEADER}` sem espaço depois do `:` é intencional: o
 Claude Desktop no Windows não escapa espaços dentro de `args` ao chamar o
 `npx`, e o header chega quebrado. O espaço vai dentro da variável.
 
-O que essa forma **não** dá: acesso pelo claude.ai ou pelo app de celular — a
-ponte roda na máquina de cada pessoa. Se isso for necessário, o caminho é (a)
-ou implementar OAuth.
+### O que o OAuth daqui não resolve
 
-### O que um bearer fixo não resolve
-
-Vale ter explícito, porque é fácil descobrir tarde:
+Vale ter explícito, porque é fácil descobrir tarde. O authorization server
+resolve o acesso pelo celular e tira o Node da máquina de cada pessoa — mas o
+modelo de permissão continua o de antes, porque quem fala com o Meta continua
+sendo um token único:
 
 - **Sem consentimento por pessoa.** Quem tem o token tem tudo que as 9 tools
-  fazem, incluindo `graph_api_get`.
+  fazem, incluindo `graph_api_get`. Um login que respeitasse o cargo de cada um
+  no Business Manager exigiria delegar ao Facebook Login — e aí entram App
+  Review, expiração de token e particionar o cache de snapshots por identidade,
+  que hoje é um arquivo só.
 - **Revogação é manual.** Sai alguém → editar `/etc/meta-mcp.env` e
-  `systemctl restart meta-mcp`.
-- **O token não expira sozinho.** Vale trocar periodicamente.
+  `systemctl restart meta-mcp`. O restart é o que derruba as sessões OAuth
+  daquela pessoa.
+- **O token do Meta não expira sozinho.** Vale trocar periodicamente.
 - **Nunca coloque o token na URL** (`?token=…`). A especificação do MCP proíbe,
   e URLs vazam em log de proxy, histórico e referrer. É por isso que aqui ele
   vai no header.
