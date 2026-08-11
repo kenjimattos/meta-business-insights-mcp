@@ -1,6 +1,6 @@
 {
   "name": "meta-business-insights-mcp",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "private": true,
   "description": "MCP server para dados orgânicos + pagos do Meta Business (Facebook Pages e Instagram) via Graph API, com agregação cross-account do portfólio.",
   "type": "module",

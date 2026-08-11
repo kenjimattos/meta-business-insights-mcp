@@ -3,6 +3,114 @@
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 Versionamento [SemVer](https://semver.org/lang/pt-BR/).
 
+## [0.2.0] — 2026-08-11
+
+Instalar o conector deixou de exigir Node na máquina de cada pessoa, e passou a
+funcionar no app de celular. O servidor ganhou um authorization server próprio
+com login pelo Google Workspace: quem entra usa a conta que já tem, e a lista
+de quem pode usar virou uma lista de e-mails em vez de uma lista de segredos.
+
+A pessoa preenche dois campos — nome e URL — deixa os campos avançados em
+branco, clica em Connect e escolhe a conta do Google. Nada de token circulando
+por chat, nada de `claude_desktop_config.json`.
+
+O Google entra **só no login**, para provar identidade. Não guardamos token
+dele nem chamamos API deles depois: o acesso ao Meta continua sendo o
+`META_ACCESS_TOKEN` único da VPS, e o login não muda o que alguém alcança no
+portfólio — só quem pode entrar.
+
+### Adicionado
+
+- **Authorization server** em [`src/oauth.ts`](src/oauth.ts): `/authorize`,
+  `/token`, `/register` e `/oauth/google/callback`, mais os dois documentos de
+  descoberta que o cliente MCP consulta.
+- **Dynamic Client Registration** (RFC 7591). É o que permite deixar Client ID
+  e Secret em branco na janela do conector — o Claude se registra sozinho.
+- **Login pelo Google Workspace** em [`src/google.ts`](src/google.ts), isolado
+  do resto para que o servidor não passe a depender de nenhuma API deles.
+- **`MCP_ALLOWED_EMAILS`** (`ana@empresa.com:write,bruno@empresa.com`) — quem
+  pode entrar, com o mesmo sufixo `:write` que já separava leitura de escrita.
+- **`MCP_OAUTH_ISSUER`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` e
+  `GOOGLE_HD`** para configurar o login.
+- **Sessões persistidas** em `oauth-sessions.json` e clientes registrados em
+  `oauth-clients.json`, ambos no `META_DATA_DIR`. Os dois sobrevivem ao restart:
+  sem isso a equipe refaria login (ou readicionaria o conector) a cada deploy.
+
+### Alterado
+
+- **`MCP_HTTP_TOKENS` virou opcional**, como saída de emergência para o `curl`
+  de diagnóstico e para a ponte local stdio→HTTP. O bearer estático continua
+  aceito direto no `/mcp`, então quem já usava a ponte não perde acesso — a
+  migração pode ser feita pessoa a pessoa.
+- **O servidor se recusa a subir** com configuração pela metade: issuer sem
+  Google, Google sem allowlist, ou nenhuma das duas formas de autenticação
+  definida.
+- **`loadConfig` valida a escrita no `META_DATA_DIR` no boot**, e por isso vale
+  para os três entrypoints — servidor HTTP, stdio e o CLI de snapshot. Sem essa
+  checagem o sintoma é traiçoeiro: o processo sobe, responde `/healthz` e
+  autentica, e só quebra quando alguém tenta gravar — no primeiro `/register`,
+  ou de madrugada no snapshot, que falha em silêncio e leva junto um dia da
+  janela de 30 dias do `follower_count`. Não basta o `mkdir`: quando o
+  diretório já existe pertencendo a outro usuário, ele passa calado, então a
+  permissão é testada de fato.
+- README: a seção de tokens da equipe virou "quem pode entrar", e o passo 5
+  passou a descrever o Google Cloud Console.
+- README: Atualização do descritivo e updates das novas funções.
+
+
+### Segurança
+
+- **PKCE S256 obrigatório**; `plain` não é aceito.
+- **O parâmetro `hd` da URL do Google não é controle de acesso** — ele só filtra
+  o seletor de contas. Quem barra é a verificação da claim `hd` no `id_token`,
+  no servidor, junto com `iss`, `aud`, `exp` e `email_verified`. Sem
+  `email_verified`, uma conta com e-mail não confirmado poderia reivindicar o
+  endereço de outra pessoa da allowlist.
+- **A assinatura do `id_token` não é verificada, de propósito.** Ele vem direto
+  do endpoint do Google, por TLS, numa requisição nossa — o caso que o OIDC Core
+  §3.1.3.7 dispensa. Verificar exigiria buscar e cachear o JWKS sem comprar
+  segurança nenhuma aqui.
+- **`client_id` e `redirect_uri` inválidos nunca viram redirect**, para não
+  transformar o `/authorize` num open redirect que entrega o código a quem
+  escolheu a URL. O `redirect_uri` é conferido contra o que aquele cliente
+  declarou no registro.
+- **Código de autorização é de uso único e queima na tentativa inválida**,
+  inclusive para o dono legítimo: um código que alguém já tentou usar
+  indevidamente não deve continuar valendo. Um cliente também não troca o código
+  emitido para outro.
+- **Revogação continua sendo apagar uma linha.** As sessões são ancoradas no
+  e-mail; o boot descarta as que saíram da allowlist, matando access e refresh
+  juntos. Os scopes são relidos da lista viva a cada request, então conceder
+  `:write` dispensa relogin.
+- **Em disco só ficam digests** — nem access token, nem refresh token, nem
+  client secret. O backup do `META_DATA_DIR` não devolve credencial utilizável.
+
+### Notas
+
+- O login prova *quem é a pessoa*, não *o que ela alcança no Meta*. Um acesso
+  que respeitasse o cargo de cada um no Business Manager exigiria delegar ao
+  Facebook Login em vez do Google — e aí entram App Review, expiração de token
+  de usuário e particionar o cache de snapshots por identidade, que hoje é um
+  arquivo só.
+- O Claude registra o cliente mais de uma vez (observadas duas chamadas ao
+  `/register` em menos de dois segundos). É inofensivo, mas explica o
+  `oauth-clients.json` crescer mais rápido que o número de pessoas; há teto de
+  500 registros, descartando os mais antigos.
+
+### Descobertas de operação
+
+Custaram tempo no primeiro deploy e não estão em lugar nenhum óbvio:
+
+- **`git pull` não atualiza o `dist/`**, que está no `.gitignore`. Sem
+  `npm ci && npm run build`, a VPS continua rodando o build antigo — e o sintoma
+  é enganoso: `/healthz` responde, o `/mcp` autentica, e só as rotas novas somem.
+- **`META_DATA_DIR` vazio não é o mesmo que ausente do ponto de vista de quem
+  edita**, mas cai no mesmo default (`~/.meta-business-insights-mcp`) — que não
+  existe para o usuário `mcp`, criado com `--no-create-home` e com
+  `ProtectHome=true` no unit. Colar o bloco do `.env.example` por cima do arquivo
+  de produção zera a variável e derruba toda escrita em disco, incluindo o
+  snapshot diário.
+
 ## [0.1.2] — 2026-08-06
 
 Primeira versão com escrita. Até aqui o servidor só lia; agora ele pode
