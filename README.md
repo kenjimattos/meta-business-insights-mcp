@@ -1,17 +1,31 @@
 # meta-business-insights-mcp
 
-Servidor MCP para o Claude Desktop ler dados do Meta Business
-(Facebook Pages e Instagram) via Graph API, com agregação cross-account do portfólio.
+Servidor MCP que dá ao Claude os dados orgânicos do Meta Business — Páginas do
+Facebook e contas do Instagram — pela Graph API.
 
-Complementa o MCP de Meta Ads: lá você vê o que veio de campanha; aqui você vê o
-número real da conta — inclusive o crescimento orgânico.
+Você pergunta pelo nome do perfil, do jeito que fala: `@programa_dotz`, "a
+página da Dotz". O servidor descobre os ativos do portfólio, resolve os Page
+Access Tokens e responde juntando as duas redes quando faz sentido.
+Complementa o MCP de Meta Ads: lá você vê o que veio de campanha; aqui, o número
+real da conta — inclusive o crescimento orgânico que campanha nenhuma explica.
 
 ## O que dá para perguntar
 
-- "Quantos seguidores o portfólio inteiro ganhou por mês em 2026?"
-- "Compare o crescimento de seguidores do Instagram entre as 5 contas maiores."
+Sobre um perfil:
+
+- "Como foi o @programa_dotz em julho? Seguidores, alcance e os posts que mais
+  performaram."
+- "Quantos seguidores a página da Dotz ganhou e perdeu por dia no último mês?"
+- "Quais publicações do @programa_dotz tiveram mais salvamentos no trimestre?"
+- "Tem gente reclamando de cobrança nos comentários da página? Procure por
+  'estorno' nos últimos 30 dias."
+- "O reel de terça segurou mais tempo de visualização que o de quinta?"
+
+Comparando ou consolidando:
+
+- "Compare o crescimento de seguidores no Instagram entre as 5 contas maiores."
 - "Qual página teve mais visitas de perfil no último trimestre?"
-- "Mostre alcance e interações por mês, consolidado, com variação mês a mês."
+- "Quantos seguidores o portfólio inteiro ganhou por mês em 2026?"
 
 ## Instalação
 
@@ -31,7 +45,7 @@ cp .env.example .env
 | `META_ACCESS_TOKEN` | sim | System User token de longa duração |
 | `META_BUSINESS_ID` | não | Fixa o portfólio; sem ele a descoberta usa `/me/businesses` e `/me/accounts` |
 | `META_API_VERSION` | não | Default `v26.0` |
-| `META_DATA_DIR` | não | Onde os snapshots locais são gravados (default `~/.meta-business-insights-mcp`) |
+| `META_DATA_DIR` | não | Onde os snapshots e as sessões OAuth são gravados (default `~/.meta-business-insights-mcp`). Na VPS aponte para o `StateDirectory` do systemd — o default não existe para um usuário de sistema sem home. O servidor confere a escrita no boot e recusa subir se não conseguir |
 | `META_PAGE_IDS` | não | Restringe o portfólio a Page IDs específicos |
 
 ### Permissões necessárias no token
@@ -337,7 +351,7 @@ Vale ter explícito, porque é fácil descobrir tarde. O Google resolve *quem é
 pessoa* — não resolve *o que ela alcança no Meta*, porque quem fala com a Graph
 API continua sendo um token único:
 
-- **Sem consentimento por pessoa.** Quem entra tem tudo que as 9 tools fazem,
+- **Sem consentimento por pessoa.** Quem entra tem tudo que as 13 tools fazem,
   incluindo `graph_api_get`. Um acesso que respeitasse o cargo de cada um no
   Business Manager exigiria delegar ao Facebook Login em vez do Google — e aí
   entram App Review, expiração de token de usuário e particionar o cache de
@@ -468,14 +482,15 @@ período.
 Desligado por padrão. Ligar exige **duas** condições simultâneas:
 
 ```bash
-META_ALLOW_WRITES=true                      # na instância
-MCP_HTTP_TOKENS=ana:3f9c…:write,bruno:a71d… # e no bearer de quem publica
+META_ALLOW_WRITES=true                          # na instância
+MCP_ALLOWED_EMAILS=ana@empresa.com:write,…      # e na pessoa que publica
 ```
 
 Sem as duas, `reply_comment` e `hide_comment` nem aparecem no `tools/list` —
 quem só consulta dados não enxerga as tools de publicação, em vez de vê-las e
-tomar um erro. No modo stdio não há bearer, então `META_ALLOW_WRITES` decide
-sozinho.
+tomar um erro. O mesmo sufixo `:write` vale em `MCP_HTTP_TOKENS`, para quem usa
+a ponte local. No modo stdio não há autenticação, então `META_ALLOW_WRITES`
+decide sozinho.
 
 Permissões adicionais: `pages_manage_engagement` no Facebook. O Instagram usa a
 mesma `instagram_manage_comments` da leitura. A task `Atividade da comunidade`
