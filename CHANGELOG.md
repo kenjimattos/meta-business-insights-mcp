@@ -36,6 +36,24 @@ Versionamento [SemVer](https://semver.org/lang/pt-BR/).
   junto com os outros, e os logins em andamento têm teto, já que o
   `/authorize` também não pede credencial.
 
+- **O refresh token passou a rotacionar, e reuso derruba a sessão.** Antes só
+  o access token era trocado na renovação: o refresh valia até a pessoa sair da
+  allowlist, então uma cópia dele — de um backup, de um log de cliente, de uma
+  máquina emprestada — rendia acesso indefinido. Agora os dois são trocados
+  juntos a cada hora, o que dá prazo de validade à cópia: ela morre na primeira
+  renovação do cliente legítimo.
+
+  O digest do refresh que sai fica guardado só para reconhecê-lo de volta. Um
+  token já gasto reaparecendo tem duas explicações — alguém com uma cópia
+  chegando depois do cliente legítimo, ou o cliente repetindo um pedido cuja
+  resposta se perdeu — e não há como distinguir. Derrubamos a sessão nos dois
+  casos, porque o custo de errar é assimétrico: no primeiro cenário deixar
+  passar entrega a sessão a quem copiou, no segundo derrubar custa um login
+  novo pelo Google. O journal registra qual e-mail caiu e por quê.
+
+  Sessões já gravadas na VPS seguem funcionando sem migração — o campo novo é
+  opcional, e a primeira renovação já as deixa rotacionando.
+
 - **O começo do `x-forwarded-for` deixou de ser levado a sério.** O cabeçalho é
   uma lista e quem chama escolhe o começo dela — o proxy só acrescenta, no fim,
   o endereço que ele mesmo enxergou. Ler o primeiro elemento deixava forjar
