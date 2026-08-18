@@ -28,6 +28,7 @@ import { captureSnapshot } from "./snapshot.js";
 import { fetchContent } from "./content.js";
 import { fetchComments } from "./comments.js";
 import { resolveRange, today, type Granularity } from "./dates.js";
+import { redactDeep, redactText } from "./redact.js";
 import {
   IG_METRICS,
   MS_METRICS,
@@ -74,8 +75,8 @@ const untilSchema = z
 
 function text(body: string, structured?: Record<string, unknown>) {
   return {
-    content: [{ type: "text" as const, text: body }],
-    ...(structured ? { structuredContent: structured } : {}),
+    content: [{ type: "text" as const, text: redactText(body) }],
+    ...(structured ? { structuredContent: redactDeep(structured) } : {}),
   };
 }
 
@@ -86,7 +87,12 @@ function fail(err: unknown) {
       : err instanceof Error
         ? err.message
         : String(err);
-  return { content: [{ type: "text" as const, text: `Erro: ${message}` }], isError: true };
+  // A Graph API às vezes ecoa a URL da chamada na mensagem de erro — e a URL
+  // carrega o token.
+  return {
+    content: [{ type: "text" as const, text: redactText(`Erro: ${message}`) }],
+    isError: true,
+  };
 }
 
 /**
