@@ -19,6 +19,31 @@ Versionamento [SemVer](https://semver.org/lang/pt-BR/).
   propósito: as mensagens JSON-RPC do `/mcp` têm poucos KB, então nada legítimo
   quebra.
 
+- **Uma enxurrada no `/register` não desconecta mais a equipe.** O teto de 500
+  registros descartava sempre os mais antigos, o que transformava o endpoint —
+  público por especificação — numa arma: quinhentos registros anônimos
+  empurravam para fora os conectores reais, e cada pessoa caía num
+  `invalid_client` do qual não se recupera sozinha, porque a saída é remover e
+  readicionar o conector. Agora o despejo só alcança registro que **ninguém
+  está usando**: cliente com sessão viva é intocável, e a lista passa do teto
+  de propósito se for esse o caso. Descartar quem nunca completou um login é
+  gratuito; deslogar quem está trabalhando, não.
+
+  Junto vieram duas contenções: o `/register` aceita 10 registros por origem a
+  cada 10 minutos (o Claude chama duas vezes ao adicionar um conector, então a
+  folga é larga), respondendo `429` com `Retry-After`; e os mapas em memória
+  deixaram de crescer sem freio — código emitido e nunca trocado agora vence
+  junto com os outros, e os logins em andamento têm teto, já que o
+  `/authorize` também não pede credencial.
+
+- **O começo do `x-forwarded-for` deixou de ser levado a sério.** O cabeçalho é
+  uma lista e quem chama escolhe o começo dela — o proxy só acrescenta, no fim,
+  o endereço que ele mesmo enxergou. Ler o primeiro elemento deixava forjar
+  linha de log e, pior, escapar de qualquer limite por origem trocando o
+  cabeçalho a cada requisição. Passamos a ler o último, e só quando a conexão
+  vem do loopback: é o desenho do deploy, com o Caddy terminando o TLS na mesma
+  máquina. Exposto direto, o cabeçalho não prova nada e vale o socket.
+
 ### Corrigido
 
 - **O token não sai mais nas respostas das tools.** A Graph API monta as URLs
