@@ -16,6 +16,10 @@
  * ancoradas no e-mail e o boot descarta as que não estão mais na allowlist —
  * access token e refresh token juntos.
  *
+ * Access e refresh são trocados juntos a cada renovação, e um refresh já gasto
+ * reaparecendo derruba a sessão: é o que impede uma cópia do token de valer
+ * para sempre, e o que deixa o roubo visível no journal.
+ *
  * O cliente se registra sozinho (RFC 7591), que é o que permite deixar os
  * campos avançados da janela em branco. A pessoa preenche dois campos: nome e
  * URL.
@@ -110,6 +114,12 @@ interface Session {
   accessDigest: string;
   accessExpiresAt: number;
   refreshDigest: string;
+  /**
+   * Digest do refresh que acabou de ser rotacionado. Não vale como credencial:
+   * existe só para reconhecer um token já gasto reaparecendo, que é o sinal de
+   * que alguém ficou com uma cópia.
+   */
+  previousRefreshDigest?: string;
 }
 
 interface PendingCode {
@@ -328,13 +338,34 @@ class SessionStore {
     return this.sessions.find((s) => s.refreshDigest === digest);
   }
 
-  /** Rotaciona só o access token; o refresh continua valendo. */
-  renew(session: Session): string {
+  /** Sessão cujo refresh anterior é este — um token já gasto, reaparecendo. */
+  findByPreviousRefresh(token: string): Session | undefined {
+    const digest = hex(token);
+    return this.sessions.find((s) => s.previousRefreshDigest === digest);
+  }
+
+  /**
+   * Troca access e refresh de uma vez, guardando o digest do refresh que sai.
+   *
+   * Rotacionar é o que dá prazo de validade a uma cópia: quem levou o refresh
+   * token perde o acesso no próximo ciclo do cliente legítimo, em vez de ficar
+   * com ele para sempre. Antes só o access token era trocado.
+   */
+  rotate(session: Session): { access: string; refresh: string } {
     const access = randomToken();
+    const refresh = randomToken();
     session.accessDigest = hex(access);
     session.accessExpiresAt = Date.now() + ACCESS_TTL_SECONDS * 1000;
+    session.previousRefreshDigest = session.refreshDigest;
+    session.refreshDigest = hex(refresh);
     persistJson(this.file, { sessions: this.sessions });
-    return access;
+    return { access, refresh };
+  }
+
+  /** Derruba a sessão inteira — access e refresh juntos. */
+  revoke(session: Session): void {
+    this.sessions = this.sessions.filter((s) => s !== session);
+    persistJson(this.file, { sessions: this.sessions });
   }
 }
 
@@ -737,7 +768,25 @@ export class AuthorizationServer {
   private refresh(form: URLSearchParams, client: RegisteredClient): Response {
     const token = form.get("refresh_token") ?? "";
     const session = token ? this.sessions.findByRefresh(token) : undefined;
-    if (!session || session.clientId !== client.clientId) {
+
+    if (!session) {
+      // Um refresh já rotacionado reaparecendo tem duas explicações: alguém
+      // ficou com uma cópia e chegou depois do cliente legítimo, ou o cliente
+      // não recebeu a resposta anterior e repetiu o pedido. Não há como
+      // distinguir — mas o custo de errar é assimétrico. Derrubar a sessão
+      // custa um login novo pelo Google; deixar passar entrega a sessão a quem
+      // copiou o token. Então derruba, e o journal registra por quê.
+      const replayed = token ? this.sessions.findByPreviousRefresh(token) : undefined;
+      if (replayed) {
+        this.log(`/token: refresh já gasto reapresentado — sessão derrubada (${replayed.email})`);
+        this.sessions.revoke(replayed);
+      }
+      return oauthError("invalid_grant", "Refresh token inválido.");
+    }
+
+    // Mesma mensagem do caso acima, de propósito: quem tenta não descobre se
+    // errou o token ou o cliente.
+    if (session.clientId !== client.clientId) {
       return oauthError("invalid_grant", "Refresh token inválido.");
     }
 
@@ -749,8 +798,8 @@ export class AuthorizationServer {
       return oauthError("invalid_grant", "Acesso revogado.");
     }
 
-    const access = this.sessions.renew(session);
-    return tokenResponse(access, token, user.scopes);
+    const { access, refresh } = this.sessions.rotate(session);
+    return tokenResponse(access, refresh, user.scopes);
   }
 
 }
