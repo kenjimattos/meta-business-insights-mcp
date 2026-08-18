@@ -25,7 +25,7 @@ import {
 import { loadConfig } from "./config.js";
 import { createServer } from "./server.js";
 import { createStaticTokenVerifier, parseAllowedEmails, parseTokens } from "./auth.js";
-import { toWebRequest, writeNodeResponse } from "./http-bridge.js";
+import { PayloadTooLargeError, toWebRequest, writeNodeResponse } from "./http-bridge.js";
 import { loadGoogleConfig } from "./google.js";
 import { AuthorizationServer, loadOAuthConfig } from "./oauth.js";
 
@@ -113,6 +113,14 @@ const handler = createMcpHandler(
 
 const server = createNodeServer((req, res) => {
   handle(req, res).catch((err) => {
+    // Corpo grande demais é rejeição esperada, não erro interno: 413 e uma
+    // linha de log, sem stack.
+    if (err instanceof PayloadTooLargeError) {
+      log(`413 ${req.method} ${req.url} de ${clientIp(req)}`);
+      if (!res.headersSent) res.writeHead(413, { "content-type": "text/plain" });
+      res.end("Payload Too Large");
+      return;
+    }
     log(`falha não tratada: ${err instanceof Error ? err.message : String(err)}`);
     if (!res.headersSent) res.writeHead(500, { "content-type": "text/plain" });
     res.end("Internal Server Error");

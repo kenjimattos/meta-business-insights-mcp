@@ -5,6 +5,20 @@ Versionamento [SemVer](https://semver.org/lang/pt-BR/).
 
 ## [Não lançado]
 
+### Segurança
+
+- **Corpo de requisição tem teto de 1 MB.** O `/register` e o `/token` são
+  públicos por especificação — a autenticação vem depois deles —, e a ponte
+  bufferizava o corpo inteiro na memória antes de qualquer validação (o limite
+  de 16 KB do `/register` só era conferido depois de já ter lido tudo). Um POST
+  anônimo de vários GB viraria pressão de memória no processo. Agora
+  [`src/http-bridge.ts`](src/http-bridge.ts) conta os bytes durante a leitura e
+  aborta assim que estoura, sem acumular o resto; [`src/http.ts`](src/http.ts)
+  responde `413` em vez de `500`. O [`deploy/Caddyfile`](deploy/Caddyfile) corta
+  o mesmo tamanho na borda, como defesa em profundidade. O teto é folgado de
+  propósito: as mensagens JSON-RPC do `/mcp` têm poucos KB, então nada legítimo
+  quebra.
+
 ### Corrigido
 
 - **O token não sai mais nas respostas das tools.** A Graph API monta as URLs
