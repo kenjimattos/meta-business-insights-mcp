@@ -150,7 +150,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return;
     }
 
-    const handled = await oauth.handle(request, url);
+    const handled = await oauth.handle(request, url, clientIp(req));
     if (handled) {
       log(`${handled.status} ${req.method} ${url.pathname} de ${clientIp(req)}`);
       await writeNodeResponse(res, handled);
@@ -197,11 +197,38 @@ function isOAuthPath(pathname: string): boolean {
   );
 }
 
+/**
+ * Endereço de quem chamou, na forma em que dá para acreditar.
+ *
+ * O `x-forwarded-for` é uma lista, e quem chama escolhe o começo dela — o
+ * proxy só *acrescenta*, no fim, o endereço que ele mesmo enxergou. Por isso
+ * lemos o último elemento: o primeiro serve tanto para forjar linha de log
+ * quanto para escapar de um limite por origem trocando o cabeçalho a cada
+ * requisição.
+ *
+ * E o cabeçalho só vale quando a conexão veio do loopback, que é o desenho do
+ * deploy — o Caddy termina o TLS na mesma máquina. Se o processo estiver
+ * exposto direto, o `x-forwarded-for` é de quem chamou e não prova nada; aí o
+ * socket é a única fonte honesta. Com o proxy em outra máquina, todo mundo cai
+ * no endereço dele e o limite vira global, que é o lado seguro de errar.
+ */
 function clientIp(req: IncomingMessage): string {
-  // Atrás do proxy o socket é sempre 127.0.0.1; o IP real vem no header.
-  const forwarded = req.headers["x-forwarded-for"];
-  const first = Array.isArray(forwarded) ? forwarded[0] : forwarded;
-  return first?.split(",")[0]?.trim() || req.socket.remoteAddress || "?";
+  const socketAddress = req.socket.remoteAddress ?? "";
+
+  if (isLoopback(socketAddress)) {
+    const forwarded = req.headers["x-forwarded-for"];
+    const chain = Array.isArray(forwarded) ? forwarded.join(",") : forwarded;
+    const last = chain?.split(",").pop()?.trim();
+    if (last) return last;
+  }
+
+  return socketAddress || "?";
+}
+
+function isLoopback(address: string): boolean {
+  return (
+    address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1"
+  );
 }
 
 /** Log em stderr, uma linha por request. Nunca imprime o token. */

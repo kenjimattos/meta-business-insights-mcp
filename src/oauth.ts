@@ -55,6 +55,20 @@ const MAX_CLIENTS = 500;
 /** Teto do corpo do `/register`, pelo mesmo motivo. */
 const MAX_REGISTRATION_BYTES = 16 * 1024;
 
+/**
+ * Registros por origem, por janela. O Claude chama o `/register` duas vezes ao
+ * adicionar um conector, então dez é folga para várias pessoas atrás do mesmo
+ * IP de escritório e ainda assim longe do que uma enxurrada precisaria.
+ */
+const REGISTER_LIMIT = 10;
+const REGISTER_WINDOW_MS = 10 * 60_000;
+
+/** Teto de origens rastreadas pelo limitador, para ele mesmo não virar o vazamento. */
+const MAX_RATE_KEYS = 10_000;
+
+/** Teto de logins em andamento. O `/authorize` não exige autenticação. */
+const MAX_PENDING = 1000;
+
 export interface OAuthConfig {
   /** URL pública do servidor, sem barra final. Vira o `issuer`. */
   issuer: string;
@@ -148,6 +162,58 @@ function readJson<T>(file: string, fallback: T): T {
 }
 
 /**
+ * Janela deslizante por origem, em memória.
+ *
+ * Existe para o `/register`, que é público por especificação — não há como
+ * exigir credencial de quem ainda não tem nenhuma. O limite não é o que
+ * protege os registros da equipe (isso é o despejo seletivo abaixo); é o que
+ * evita que a enxurrada chegue a custar disco e CPU.
+ */
+class RateLimiter {
+  private readonly hits = new Map<string, number[]>();
+  private lastSweep = 0;
+
+  constructor(
+    private readonly limit: number,
+    private readonly windowMs: number,
+    private readonly maxKeys: number,
+  ) {}
+
+  /** `true` libera e consome uma vaga. */
+  take(key: string, now = Date.now()): boolean {
+    // Varrer a cada chamada seria O(origens) por request. Uma vez por janela
+    // basta, porque o que se acumula entre varreduras tem o teto de chaves.
+    if (now - this.lastSweep >= this.windowMs) this.sweep(now);
+
+    if (!this.hits.has(key) && this.hits.size >= this.maxKeys) {
+      this.sweep(now);
+      // Cheio mesmo depois da varredura são milhares de origens distintas
+      // registrando na mesma janela, que não é uso real. Recusar é melhor que
+      // guardar: quem já tem conector segue funcionando de qualquer forma,
+      // porque sessão viva protege o registro do despejo.
+      if (this.hits.size >= this.maxKeys) return false;
+    }
+
+    const fresh = (this.hits.get(key) ?? []).filter((t) => t > now - this.windowMs);
+    this.hits.set(key, fresh);
+    if (fresh.length >= this.limit) return false;
+
+    fresh.push(now);
+    return true;
+  }
+
+  private sweep(now: number): void {
+    const cutoff = now - this.windowMs;
+    for (const [key, times] of this.hits) {
+      const fresh = times.filter((t) => t > cutoff);
+      if (fresh.length === 0) this.hits.delete(key);
+      else this.hits.set(key, fresh);
+    }
+    this.lastSweep = now;
+  }
+}
+
+/**
  * Clientes registrados. Precisa persistir: o Claude registra uma vez e guarda o
  * `client_id` na conta — se a lista sumisse no restart, todo mundo cairia num
  * `invalid_client` sem forma de se recuperar sozinho.
@@ -163,15 +229,43 @@ class ClientStore {
     return this.clients.find((c) => c.clientId === clientId);
   }
 
-  add(client: RegisteredClient): void {
+  /**
+   * Guarda o registro, abrindo espaço só entre os que ninguém está usando.
+   *
+   * `inUse` são os clientes com sessão viva. Sem essa distinção, o teto vira
+   * uma arma: o `/register` é público, e quinhentos registros anônimos
+   * empurrariam para fora os conectores reais da equipe — cada pessoa caindo
+   * num `invalid_client` do qual não se recupera sozinha, porque a saída é
+   * remover e readicionar o conector. Descartar quem nunca completou um login
+   * é gratuito: aquele registro não vale nada para ninguém.
+   *
+   * Se sobrar só cliente em uso, a lista passa do teto de propósito. Ela é
+   * limitada na prática por quantas pessoas estão na allowlist, e estourar a
+   * contagem é muito melhor que deslogar alguém que está trabalhando.
+   */
+  add(client: RegisteredClient, inUse: Set<string>): { evicted: number; total: number } {
     this.clients.push(client);
-    // O `/register` é público por especificação. Descartar o mais antigo é
-    // preferível a recusar registros novos para sempre depois de um abuso.
-    if (this.clients.length > MAX_CLIENTS) {
-      this.clients.sort((a, b) => a.createdAt - b.createdAt);
-      this.clients = this.clients.slice(this.clients.length - MAX_CLIENTS);
+
+    let evicted = 0;
+    const excess = this.clients.length - MAX_CLIENTS;
+    if (excess > 0) {
+      // O recém-criado também é poupado: ele ainda não tem sessão, mas o
+      // `/token` está a segundos de distância.
+      const doomed = new Set(
+        this.clients
+          .filter((c) => c.clientId !== client.clientId && !inUse.has(c.clientId))
+          .sort((a, b) => a.createdAt - b.createdAt)
+          .slice(0, excess)
+          .map((c) => c.clientId),
+      );
+      if (doomed.size > 0) {
+        this.clients = this.clients.filter((c) => !doomed.has(c.clientId));
+        evicted = doomed.size;
+      }
     }
+
     persistJson(this.file, { clients: this.clients });
+    return { evicted, total: this.clients.length };
   }
 }
 
@@ -200,6 +294,14 @@ class SessionStore {
     const removed = before - this.sessions.length;
     if (removed > 0) persistJson(this.file, { sessions: this.sessions });
     return removed;
+  }
+
+  /**
+   * Clientes com sessão viva. É o que separa, na hora do despejo, o conector
+   * que alguém usa todo dia do registro que nunca completou um login.
+   */
+  activeClientIds(): Set<string> {
+    return new Set(this.sessions.map((s) => s.clientId));
   }
 
   create(email: string, clientId: string): { access: string; refresh: string } {
@@ -241,6 +343,11 @@ export class AuthorizationServer {
   private readonly sessions: SessionStore;
   private readonly codes = new Map<string, PendingCode>();
   private readonly pending = new Map<string, PendingAuthorization>();
+  private readonly registerLimit = new RateLimiter(
+    REGISTER_LIMIT,
+    REGISTER_WINDOW_MS,
+    MAX_RATE_KEYS,
+  );
 
   constructor(
     private readonly config: OAuthConfig,
@@ -309,10 +416,18 @@ export class AuthorizationServer {
    * Roteia as rotas do AS. Devolve `undefined` quando o caminho não é dele,
    * para `http.ts` seguir com o roteamento normal.
    */
-  async handle(request: Request, url: URL): Promise<Response | undefined> {
+  async handle(
+    request: Request,
+    url: URL,
+    clientIp: string,
+  ): Promise<Response | undefined> {
     if (url.pathname === "/register") {
       if (request.method === "OPTIONS") return preflight("POST");
       if (request.method !== "POST") return methodNotAllowed("POST");
+      if (!this.registerLimit.take(clientIp)) {
+        this.log(`/register recusado: limite por origem (${clientIp})`);
+        return tooManyRequests();
+      }
       return this.register(request);
     }
 
@@ -378,14 +493,23 @@ export class AuthorizationServer {
         ? metadata.client_name.trim().slice(0, 80)
         : "cliente sem nome";
 
-    this.clients.add({
-      clientId,
-      secretDigest: secret ? hex(secret) : null,
-      redirectUris,
-      name,
-      createdAt: Date.now(),
-    });
+    const { evicted, total } = this.clients.add(
+      {
+        clientId,
+        secretDigest: secret ? hex(secret) : null,
+        redirectUris,
+        name,
+        createdAt: Date.now(),
+      },
+      this.sessions.activeClientIds(),
+    );
     this.log(`/register: "${name}" registrado (${isPublic ? "público" : "confidencial"})`);
+    if (evicted > 0) {
+      this.log(`/register: ${evicted} registro(s) sem sessão descartado(s) pelo teto`);
+    }
+    if (total > MAX_CLIENTS) {
+      this.log(`/register: ${total} registros, acima do teto — todos com sessão viva`);
+    }
 
     return json(
       {
@@ -441,6 +565,17 @@ export class AuthorizationServer {
 
     // Dois `state` no mesmo fluxo: este é o nosso, para o Google; o do Claude
     // fica guardado aqui dentro e volta no redirect final.
+    // Varre antes de guardar mais um: o `/authorize` não pede credencial, então
+    // quem registrou um cliente pode chamá-lo em série.
+    sweepExpired(this.pending);
+    if (this.pending.size >= MAX_PENDING) {
+      // Todos ainda dentro do prazo. Descartar o mais antigo custa, no pior
+      // caso, um login em andamento que se resolve tentando de novo — bem
+      // menos que deixar a memória crescer com abas que ninguém abriu.
+      const oldest = this.pending.keys().next().value;
+      if (oldest) this.pending.delete(oldest);
+    }
+
     const googleState = randomToken();
     this.pending.set(googleState, {
       clientId,
@@ -449,7 +584,6 @@ export class AuthorizationServer {
       challenge,
       expiresAt: Date.now() + PENDING_TTL_MS,
     });
-    this.sweepPending();
 
     return new Response(null, {
       status: 302,
@@ -499,6 +633,10 @@ export class AuthorizationServer {
           "Peça para ser incluído e tente de novo.",
       );
     }
+
+    // Código emitido e nunca trocado (a pessoa fechou a aba) ficaria guardado
+    // para sempre — o `exchangeCode` só apaga o que alguém veio buscar.
+    sweepExpired(this.codes);
 
     const authCode = randomToken();
     this.codes.set(hex(authCode), {
@@ -615,12 +753,13 @@ export class AuthorizationServer {
     return tokenResponse(access, token, user.scopes);
   }
 
-  /** Limpa pedidos abandonados — quem abriu o login e fechou a aba. */
-  private sweepPending(): void {
-    const now = Date.now();
-    for (const [key, value] of this.pending) {
-      if (value.expiresAt <= now) this.pending.delete(key);
-    }
+}
+
+/** Limpa o que venceu — logins abandonados e códigos que ninguém veio trocar. */
+function sweepExpired(map: Map<string, { expiresAt: number }>): void {
+  const now = Date.now();
+  for (const [key, value] of map) {
+    if (value.expiresAt <= now) map.delete(key);
   }
 }
 
@@ -684,6 +823,24 @@ function redirectError(
   target.searchParams.set("error_description", description);
   if (state) target.searchParams.set("state", state);
   return new Response(null, { status: 302, headers: { location: target.toString() } });
+}
+
+function tooManyRequests(): Response {
+  return new Response(
+    JSON.stringify({
+      error: "too_many_requests",
+      error_description: "Registros demais desta origem. Tente de novo em alguns minutos.",
+    }),
+    {
+      status: 429,
+      headers: {
+        "content-type": "application/json",
+        "cache-control": "no-store",
+        "access-control-allow-origin": "*",
+        "retry-after": String(Math.ceil(REGISTER_WINDOW_MS / 1000)),
+      },
+    },
+  );
 }
 
 function methodNotAllowed(allow: string): Response {
