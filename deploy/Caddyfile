@@ -7,6 +7,13 @@
 mcp.exemplo.com {
 	encode zstd gzip
 
+	# Corta corpos absurdos na borda, antes de chegar ao Node. /register e
+	# /token são públicos; sem isto um POST anônimo gigante viraria pressão de
+	# memória. O servidor tem o mesmo teto por dentro, como defesa em profundidade.
+	request_body {
+		max_size 1MB
+	}
+
 	reverse_proxy 127.0.0.1:8787 {
 		# Desliga o buffering da resposta. Sem isso o Caddy segura os eventos
 		# SSE até o fim do stream e as consultas longas (o Meta é lento)
