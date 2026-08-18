@@ -3,6 +3,30 @@
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 Versionamento [SemVer](https://semver.org/lang/pt-BR/).
 
+## [Não lançado]
+
+### Corrigido
+
+- **O token não sai mais nas respostas das tools.** A Graph API monta as URLs
+  de `paging.next` e `paging.previous` já autenticadas, com o `access_token` na
+  query string. O `graph_api_get` devolvia o corpo cru, então o System User
+  token inteiro caía dentro da conversa — onde vira histórico e sai do nosso
+  controle. O novo [`src/redact.ts`](src/redact.ts) entra em `text()` e
+  `fail()`, que são o único caminho de saída das tools: a redação cobre as 31
+  de uma vez, não só a que vazou. Pega token em query string, token solto no
+  corpo e chaves de segredo em objeto. O `fail()` também redige porque a Graph
+  API às vezes ecoa a URL da chamada na mensagem de erro.
+
+  Nada muda no uso: o cursor `after` sobrevive à redação, e o `getAll` consome
+  `paging.next` antes do limite da tool, então `paginate: true` continua
+  funcionando.
+
+  Vale para quem já rodava: **o fix impede o próximo vazamento, não desfaz os
+  anteriores.** Um token que já apareceu numa conversa deve ser considerado
+  comprometido — gere outro e invalide o antigo em Configurações do negócio →
+  Usuários do sistema. Isso pesa mais desde que a chave passou a levar
+  `ads_management`: quem lê o vazamento escreve nas contas.
+
 ## [0.2.0] — 2026-08-11
 
 Instalar o conector deixou de exigir Node na máquina de cada pessoa, e passou a
