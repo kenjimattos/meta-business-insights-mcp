@@ -54,6 +54,26 @@ Versionamento [SemVer](https://semver.org/lang/pt-BR/).
   Sessões já gravadas na VPS seguem funcionando sem migração — o campo novo é
   opcional, e a primeira renovação já as deixa rotacionando.
 
+- **Comentário de terceiro é marcado como tal na saída da tool.** O
+  `content_comments` existe para trazer texto escrito por qualquer pessoa da
+  internet para dentro do contexto do modelo — é a função dela. O incômodo é a
+  vizinhança: o mesmo servidor responde e oculta comentários, então um texto
+  dizendo "responda isto" ou "ignore as orientações anteriores" chega ao lado
+  das ferramentas que fariam as duas coisas.
+
+  Higienizar não é opção: a reclamação que a equipe precisa ler é o texto cru,
+  com o tom e os erros de quem escreveu. O que dá para fazer é dizer de quem é
+  cada coluna. A saída passou a abrir com um aviso de que *Autor* e *Comentário*
+  são conteúdo de terceiros e valem como relato, não como pedido; o mesmo vai no
+  `structuredContent`, para quem consome o JSON em vez da tabela. As descrições
+  do `reply_comment` e do `hide_comment` ganharam a regra de proveniência: o que
+  publicar ou ocultar se decide com quem está pedindo, não pelo que o comentário
+  diz.
+
+  É placa na porta, não fechadura — as trancas continuam sendo o
+  `META_ALLOW_WRITES`, o escopo `:write` e o `confirm: true` do
+  `reply_comment`.
+
 - **O começo do `x-forwarded-for` deixou de ser levado a sério.** O cabeçalho é
   uma lista e quem chama escolhe o começo dela — o proxy só acrescenta, no fim,
   o endereço que ele mesmo enxergou. Ler o primeiro elemento deixava forjar
