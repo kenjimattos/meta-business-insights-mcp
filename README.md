@@ -184,10 +184,26 @@ install -m 600 /dev/null /etc/meta-mcp.env
 $EDITOR /etc/meta-mcp.env     # META_ACCESS_TOKEN, META_BUSINESS_ID,
                               # MCP_ALLOWED_EMAILS, META_DATA_DIR=/var/lib/meta-mcp,
                               # MCP_OAUTH_ISSUER e GOOGLE_* (veja o passo 5)
+stat -c '%a %U:%G' /etc/meta-mcp.env    # confira: 600 root:root
 cp deploy/meta-mcp.service /etc/systemd/system/
 systemctl daemon-reload && systemctl enable --now meta-mcp
 journalctl -u meta-mcp -f
 ```
+
+Confira o `stat` mesmo tendo criado o arquivo com `install -m 600`, e repita a
+checagem depois de cada edição: o modo volta a `644` com facilidade — um
+`cat >` para reescrever o conteúdo, um `scp` de outra máquina, um editor que
+grava recriando o arquivo em vez de sobrescrever. O serviço sobe igual dos dois
+jeitos e nada no journal denuncia a diferença, então a divergência passa
+despercebida enquanto o token do Meta fica legível para qualquer conta da
+máquina.
+
+Se estiver errado, `chmod 600 /etc/meta-mcp.env` resolve e **não** é preciso
+reiniciar o serviço. O `EnvironmentFile` é lido pelo systemd, que roda como
+`root`, antes de baixar o privilégio para `User=mcp` — o processo Node nunca abre
+esse arquivo, recebe as variáveis já prontas no ambiente. Ou seja, ele não
+precisa ser legível por mais ninguém — afrouxar para `644` "para o `mcp`
+conseguir ler" é exatamente o engano a evitar.
 
 ### 3. Snapshot diário
 
