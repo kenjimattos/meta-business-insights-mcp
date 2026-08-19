@@ -104,6 +104,31 @@ Versionamento [SemVer](https://semver.org/lang/pt-BR/).
   Usuários do sistema. Isso pesa mais desde que a chave passou a levar
   `ads_management`: quem lê o vazamento escreve nas contas.
 
+### Descobertas de operação
+
+- **O `/etc/meta-mcp.env` da VPS estava `644`, não `600`.** A instrução estava
+  certa nos dois lugares — o README mandava criar com `install -m 600`, o unit
+  do systemd dizia "modo 0600, dono root" — e a realidade divergiu dela mesmo
+  assim. O modo volta com facilidade: um `cat >` para reescrever o conteúdo, um
+  `scp` de outra máquina, um editor que grava recriando o arquivo em vez de
+  sobrescrever. E nada denuncia: o serviço sobe igual dos dois jeitos e o
+  journal não registra diferença, enquanto o `META_ACCESS_TOKEN`, o
+  `GOOGLE_CLIENT_SECRET` e os `MCP_HTTP_TOKENS` ficam legíveis para qualquer
+  conta da máquina.
+
+  Nada esteve exposto pela rede — o Caddy não serve `/etc`, então o alcance era
+  o de contas locais com shell na VPS. Corrigido com `chmod 600`, sem precisar
+  reiniciar o serviço.
+
+  Criar certo não bastou, então as instruções de instalação ganharam a
+  verificação: `stat -c '%a %U:%G' /etc/meta-mcp.env` logo depois da edição, com
+  o pedido de repeti-la a cada alteração. Junto ficou registrado que o
+  `EnvironmentFile` é lido pelo systemd como `root`, antes de baixar o
+  privilégio para `User=mcp` — o processo Node nunca abre esse arquivo. Isso
+  importa porque o engano natural, diante de um erro de permissão, é afrouxar
+  para `644` "para o `mcp` conseguir ler", que é justamente como se volta ao
+  problema.
+
 ## [0.2.0] — 2026-08-11
 
 Instalar o conector deixou de exigir Node na máquina de cada pessoa, e passou a
