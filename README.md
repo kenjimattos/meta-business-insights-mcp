@@ -555,6 +555,15 @@ Tudo abaixo foi verificado contra a API real na v26, não só lido na documenta�
   relatório — se a janela cruzasse a fronteira do mês, o valor inteiro cairia em um
   só lado. Consultas que exigiriam mais de 600 chamadas são recusadas com uma
   mensagem explicando como reduzir o recorte.
+- **Métricas demográficas exigem `period=lifetime`.** `follower_demographics` e
+  afins recusam o `period=day` com `(#100) The following periods (day) are
+  incompatible with the metric`. A combinação aceita é `period=lifetime` +
+  `timeframe` + `metric_type=total_value`, sem `since`/`until`.
+- **Janela sem dados devolve breakdown sem `results`.** Pedindo um breakdown de
+  um dia que o Meta ainda não consolidou (tipicamente hoje), o `total_value`
+  volta com `breakdowns: [{ dimension_keys: [...] }]` — o campo `results` é
+  simplesmente omitido, não vem como lista vazia. Os parsers tratam a ausência;
+  cuidado ao escrever um novo.
 - **Janela máxima por request**: 93 dias em Page Insights, 30 dias no Instagram
   (`(#100) There cannot be more than 30 days between since and until`). As
   consultas são fatiadas e recombinadas automaticamente.
