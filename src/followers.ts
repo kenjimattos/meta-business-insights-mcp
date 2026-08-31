@@ -62,7 +62,8 @@ interface RawInsightResponse {
       value?: number;
       breakdowns?: Array<{
         dimension_keys: string[];
-        results: Array<{ dimension_values: string[]; value: number }>;
+        /** Ausente quando a janela ainda não tem dados (ex.: o dia de hoje). */
+        results?: Array<{ dimension_values: string[]; value: number }>;
       }>;
     };
   }>;
@@ -315,7 +316,7 @@ async function fetchInstagramFollowers(
 
     for (const insight of res.data.data ?? []) {
       for (const bd of insight.total_value?.breakdowns ?? []) {
-        for (const result of bd.results) {
+        for (const result of bd.results ?? []) {
           const bucket = classifyFollowType(result.dimension_values[0]);
           if (bucket === "gained") slot.gained += result.value;
           else if (bucket === "lost") slot.lost += result.value;

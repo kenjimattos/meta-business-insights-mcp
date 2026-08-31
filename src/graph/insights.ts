@@ -66,7 +66,8 @@ interface RawInsight {
     value?: number;
     breakdowns?: Array<{
       dimension_keys: string[];
-      results: Array<{ dimension_values: string[]; value: number }>;
+      /** Ausente quando a janela ainda não tem dados (ex.: o dia de hoje). */
+      results?: Array<{ dimension_values: string[]; value: number }>;
     }>;
   };
 }
@@ -128,7 +129,7 @@ function toPoints(raw: RawInsight, windowEnd: string, shiftDays: number): Series
       points.push({ date: windowEnd, value });
     }
     for (const bd of breakdowns ?? []) {
-      for (const result of bd.results) {
+      for (const result of bd.results ?? []) {
         const dims: Record<string, string> = {};
         bd.dimension_keys.forEach((key, i) => {
           dims[key] = result.dimension_values[i] ?? "";
