@@ -343,6 +343,8 @@ export async function fetchInstagramInsights(
 
     if (demographic.length > 0) {
       const req = base(demographic, "total_value", query.since, query.until);
+      // Métricas demográficas rejeitam period=day; exigem lifetime + timeframe.
+      req.params.period = "lifetime";
       req.params.timeframe = query.timeframe ?? "this_month";
       delete req.params.since;
       delete req.params.until;
