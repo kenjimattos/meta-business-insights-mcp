@@ -3,6 +3,25 @@
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 Versionamento [SemVer](https://semver.org/lang/pt-BR/).
 
+## [Não lançado]
+
+### Corrigido
+
+- **`followers_timeseries` não cai mais com `bd.results is not iterable`.** A
+  Graph API omite o campo `results` do breakdown quando a janela ainda não tem
+  dados — tipicamente o dia de hoje —, e o parser iterava o campo sem guarda.
+  Como a tool estende o intervalo até hoje por design (a reconstrução do total
+  do Instagram parte do `followers_count` atual), **toda** chamada incluía a
+  janela vazia e a resposta inteira caía. O mesmo parser sem guarda existia em
+  [`src/graph/insights.ts`](src/graph/insights.ts), onde derrubava o
+  `instagram_insights` sempre que o intervalo incluía hoje e havia breakdown.
+
+- **Métricas demográficas voltaram a funcionar no `instagram_insights`.** O
+  branch demográfico herdava o `period=day` do helper que monta as requisições,
+  e a API rejeitava com `(#100) The following periods (day) are incompatible
+  with the metric (follower_demographics)`. Demografia exige `period=lifetime`
+  junto com `timeframe` e `metric_type=total_value` — verificado contra a v26.
+
 ## [0.2.1] — 2026-08-19
 
 ### Segurança
